@@ -1,5 +1,5 @@
 # MultiMatch ITR
-The R codes for our paper ***Multiple Treatments Matched Learning for Individualized Treatment Rules***. In our paper, a method based on matching is proposed to
+The R codes for our paper ***Multicategory Matched Learning for Estimating Optimal Individualized Treatment Rules in Observational Studies with Application to a Hepatocellular Carcinoma Study***. In our paper, a method based on matching is proposed to
 estimate the optimal ITRs with continuous and survival data in multi-arm observational study. 
 
 ## Simulation studies
