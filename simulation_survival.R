@@ -13,29 +13,32 @@ library(survival)
 library(parallel)
 library(snowfall)
 library(randomForestSRC)
-
+library(glmnet)
+# library(glmnetUtils) #install_github("hong-revo/glmnetUtils")
+library(statmod)
 ######Basic parameters########
 n <- 1000
+n.test <-20000
 p <- 6
-K <- classK <- 4
-calipernum <- NULL  #Match calipers
+K <- 4
 this.seed <- 2020
-outcome_setting <- "coxph"  #survival outcome 
-correctPS <- TRUE
+outcome_setting <- "lognormal"  #survival outcome model: coxph, coxph2(stratified Cox model), log-normal
+correctPS <- TRUE #correct propensity score model
 
 lambda_param <- c(1e-06, 1e-05, 1e-04, 0.001, 0.01, 0.1, 1)  #penalty tuning parameter
 kernel_param <- c(1) #Gaussian kernel parameter
 
+if.imputeR2=TRUE #R1:impute by E(T|A,X); R2: impute by delta*T+(1-delta)*E(tildeT|A,X,tildeT>T,T). Default is R2
 #######Survival setting#######
 if (!(outcome_setting %in% c("lognormal", "coxph", "coxph2"))) {
   print("No such setting!")
 }
 tau_coxph <- 2.7  #length of study
-tau_coxph2 <- 9.1
+tau_coxph2 <- 12.1
 tau_lognormal <- 11.7
 
 theta_coxph <- 0.2 #for censoring rate
-theta_coxph2 <- 0.1
+theta_coxph2 <- 0.09
 theta_lognormal <- 0.08
 
 if (outcome_setting == "coxph") {
@@ -124,13 +127,13 @@ getdata <- function(n, p, seed, decision_boundary = "linear", outcome_model = "s
     A[i] <- sample(x = 1:4, size = 1, replace = FALSE, prob = c(propensity(1, X[i, ]), propensity(2, X[i, ]), propensity(3, X[i, ]), propensity(4, X[i, ])))
   }
   
-  #sample n/K for each treatment
+  #sample n/K for each treatment, similar argument as the github code of Shu Yang et al. (2016) Propensity Score Matching and Subclassification in Observational Studies with Multi-Level Treatments
   class_balance_index <- c(sample(which(A == 1), n/K), sample(which(A == 2), n/K), sample(which(A == 3), n/K), sample(which(A == 4), n/K))
   A <- A[class_balance_index]
   X <- X[class_balance_index, ]
   
   #First generate true optimal ITR then generate outcome based on continuous setting, generate survival outcome at last
-  R_continuous <- R <- optA <- rep(0, n)
+  R_continuous <- R <- observeR <- optA <- rep(0, n)
   for (i in 1:n) {
     if (decision_boundary == "linear") {
       if (X[i, 1] > 1/2 & X[i, 2] > 1/2) {
@@ -157,19 +160,24 @@ getdata <- function(n, p, seed, decision_boundary = "linear", outcome_model = "s
     }
   }
   
+  #generate true survival time R
   for (i in 1:n) {
     if (outcome_setting == "coxph") {
-      R[i] <- min(rweibull(1, shape = 2, scale = exp(-(R_continuous[i]))^(-1/2)), tau)
+      R[i] <- rweibull(1, shape = 2, scale = exp(-(R_continuous[i]))^(-1/2))
     } else if (outcome_setting == "coxph2") {
-      R[i] <- min(coxph2(A = A[i], R_continuous = R_continuous[i]), tau)
+      R[i] <- coxph2(A = A[i], R_continuous = R_continuous[i])
     } else {
-      R[i] <- min(exp(R_continuous[i] + rnorm(1)), tau)
+      R[i] <- exp(R_continuous[i] + rnorm(1))
     }
   }
   
   censoringtime <- rexp(n, theta)
   event <- as.numeric(R <= censoringtime)
-  observeR <- R * event + censoringtime * (rep(1, n) - event)
+  event[which(R>=tau)]=0
+  
+  for(i in 1:n){
+    observeR[i] = min(c(R[i],censoringtime[i],tau))
+  }
   
   return(data.frame(X = X, censor = event, R = observeR, A = A, trueR = R, optA = optA))
 }
@@ -185,7 +193,7 @@ test_data <- function(n = 20000, decision_boundary = "linear", outcome_model = "
   }
   
   #First generate true optimal ITR then generate outcome based on continuous setting, generate survival outcome at last
-  R_continuous <- R <- optA <- rep(0, n)
+  R_continuous <- R <- observeR <- optA <- rep(0, n)
   for (i in 1:n) {
     if (decision_boundary == "linear") {
       if (X[i, 1] > 1/2 & X[i, 2] > 1/2) {
@@ -212,19 +220,24 @@ test_data <- function(n = 20000, decision_boundary = "linear", outcome_model = "
     }
   }
   
+  #generate true survival time R
   for (i in 1:n) {
     if (outcome_setting == "coxph") {
-      R[i] <- min(rweibull(1, shape = 2, scale = exp(-(R_continuous[i]))^(-1/2)), tau)
+      R[i] <- rweibull(1, shape = 2, scale = exp(-(R_continuous[i]))^(-1/2))
     } else if (outcome_setting == "coxph2") {
-      R[i] <- min(coxph2(A = A[i], R_continuous = R_continuous[i]), tau)
+      R[i] <- coxph2(A = A[i], R_continuous = R_continuous[i])
     } else {
-      R[i] <- min(exp(R_continuous[i] + rnorm(1)), tau)
+      R[i] <- exp(R_continuous[i] + rnorm(1))
     }
   }
   
   censoringtime <- rexp(n, theta)
   event <- as.numeric(R <= censoringtime)
-  observeR <- R * event + censoringtime * (rep(1, n) - event)
+  event[which(R>=tau)]=0
+  
+  for(i in 1:n){
+    observeR[i] = min(c(R[i],censoringtime[i],tau))
+  }
   
   return(data.frame(X = X, censor = event, R = observeR, A = A, trueR = R, optA = optA))
 }
@@ -235,8 +248,20 @@ coxph2 <- function(A, R_continuous) {
     k <- 1
     coxph2 <- rweibull(1, shape = k, scale = exp(-(R_continuous))^(-1/k))
   } else if (A == 2) {
-    k <- 0.5
-    coxph2 <- rweibull(1, shape = k, scale = exp(-(R_continuous))^(-1/k))
+    u=runif(1)
+    parahaz2_1=5
+    parahaz2_2=2
+    parahaz2_3=0.7
+    interval_length=0.01
+    tdom = t <- seq(0, 20, by=interval_length) 
+    haz <- rep(0, length(tdom))
+    haz[tdom <= 0.3] <- (parahaz2_1)*exp(-R_continuous)
+    haz[tdom > 0.3 & tdom <= 8] <- (parahaz2_2)*exp(-R_continuous)
+    haz[tdom > 8 ] <- (parahaz2_3)*exp(-R_continuous)
+    cumhaz <- cumsum(haz*interval_length)
+    Surv <- exp(-cumhaz*exp(-R_continuous))
+    Surv=c(1,Surv[-c(length(Surv))])
+    coxph2=tdom[colSums(outer(Surv, u, `>=`))]  
   } else if (A == 3) {
     u <- runif(1)
     parahaz3 <- 0.3
@@ -354,142 +379,84 @@ owl.md <- function(X, R, A, testX) {
   return(as.numeric(trt.owlmd))
 }
 
-#multiple treatment matching
-MultiMatch <- function(reference_group, simu_GPS, calipernum) {
-  # Input: reference_group and data for matching
-  # Output: multiple treatment matching results 
-  # T1 always denotes reference_group
-  dim_simuGPS <- dim(simu_GPS)[2]
-  if (reference_group == 1) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 1"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 3"
-    simu_GPS$T4 <- simu_GPS$treat == "Treatment 4"
-    trueT1 <- 1
-    trueT2 <- 2
-    trueT3 <- 3
-    trueT4 <- 4
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T), which(simu_GPS$T4 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  } else if (reference_group == 2) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 1"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 3"
-    simu_GPS$T4 <- simu_GPS$treat == "Treatment 4"
-    trueT1 <- 2
-    trueT2 <- 1
-    trueT3 <- 3
-    trueT4 <- 4
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T), which(simu_GPS$T4 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  } else if (reference_group == 3) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 3"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 1"
-    simu_GPS$T4 <- simu_GPS$treat == "Treatment 4"
-    trueT1 <- 3
-    trueT2 <- 2
-    trueT3 <- 1
-    trueT4 <- 4
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T), which(simu_GPS$T4 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  } else {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 4"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 3"
-    simu_GPS$T4 <- simu_GPS$treat == "Treatment 1"
-    trueT1 <- 4
-    trueT2 <- 2
-    trueT3 <- 3
-    trueT4 <- 1
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T), which(simu_GPS$T4 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  }
+#multiple treatment matching with covariate/GPS for continuous/survival outcome
+MultiMatchGeneral<-function(inputdata,if.matching.GPS=FALSE){
+  #Multiple treatment matching with covariate/GPS for continuous/survival outcome, Mahalanobis distance is used
+  #input inputdata includes: X1,..,Xp,censor,R(observed outcome,but actually not used in this function),
+  #A(must take value in seq(K)),impute(for continuous outcome, it is the same as R). The first p columns inputdata[,1:p] should be X1,..,Xp that used for matching (or estimating GPS if.matching.GPS=TRUE)
+  #output original inputdata with additional information: matched set,weight,the treatment w.r.t. the maximum potential outcome, and the maximum and minimum potential outcomes
+  if(length(unique(inputdata$A))!=K) return("Treatment vector A is not {1,2,..,K}")
   
-  # T1 reference treatment
-  temp12 <- dplyr::filter(simu_GPS, treat != paste("Treatment", trueT3) & treat != paste("Treatment", trueT4))
-  temp13 <- dplyr::filter(simu_GPS, treat != paste("Treatment", trueT2) & treat != paste("Treatment", trueT4))
-  temp14 <- dplyr::filter(simu_GPS, treat != paste("Treatment", trueT2) & treat != paste("Treatment", trueT3))
+  n=nrow(inputdata) # sample size
   
-  
-  # matching T1 with the remaining groups
-  match12 <- Match(Y = NULL, Tr = temp12$treat == paste("Treatment", trueT1), X = temp12[, 1:6], caliper = calipernum, ties = FALSE)
-  match13 <- Match(Y = NULL, Tr = temp13$treat == paste("Treatment", trueT1), X = temp13[, 1:6], caliper = calipernum, ties = FALSE)
-  match14 <- Match(Y = NULL, Tr = temp14$treat == paste("Treatment", trueT1), X = temp14[, 1:6], caliper = calipernum, ties = FALSE)
-  
-  simu_GPS$id <- 1:nrow(simu_GPS)
-  
-  #units in T1 that matched to all the remaining groups
-  simu_GPS$both.1 <- simu_GPS$id %in% match12$index.treated & simu_GPS$id %in% match13$index.treated & simu_GPS$id %in% match14$index.treated
-  
-  temp <- simu_GPS[simu_GPS$both.1 == "TRUE", ]
-  m12 <- cbind(match12$index.treated, match12$index.control)
-  m13 <- cbind(match13$index.treated, match13$index.control + sum(simu_GPS$T2 == T))
-  m14 <- cbind(match14$index.treated, match14$index.control + sum(simu_GPS$T2 == T) + sum(simu_GPS$T3 == T))
-  
-  m12 <- m12[m12[, 1] %in% rownames(temp), ]
-  m13 <- m13[m13[, 1] %in% rownames(temp), ]
-  m14 <- m14[m14[, 1] %in% rownames(temp), ]
-  
-  matchset <- cbind(m12[order(m12[, 1]), ], m13[order(m13[, 1]), ], m14[order(m14[, 1]), ])
-  matchset <- as.matrix(matchset[, c(1, 2, 4, 6)])  #Matched set
-  n.trip <- nrow(matchset)
-  
-  ############ Deal with the matching result#########
-  #In the same match set, Bi denote argmax Ri, R_Bi denote maxRi, Ci denote argmax Ri, R_Ci denote minRi, g_weight denote g1() in paper 
-  simu_GPS <- cbind(simu_GPS[, 1:dim_simuGPS], B = rep(0, dim(simu_GPS)[1]), R_Bi = rep(0, dim(simu_GPS)[1]), R_Ci = rep(0, dim(simu_GPS)[1]), g_weight = rep(0, dim(simu_GPS)[1]))
-  for (i in 1:n.trip) {
-    index <- matchset[i, ]
-    temp <- data.frame(index = c(index[1], index[2], index[3], index[4]), impute = c(simu_GPS$impute[index[1]], simu_GPS$impute[index[2]], 
-                                                                                     simu_GPS$impute[index[3]], simu_GPS$impute[index[4]]), trt = c(trueT1,trueT2, trueT3, trueT4))  
-    maxvalue <- apply(temp, 2, max)[2]  
-    minvalue <- apply(temp, 2, min)[2]  
-    argmax <- temp[which(temp$impute == maxvalue), 3]  
-    argmin <- temp[which(temp$impute == minvalue), 3]  
-    if (length(argmax) != 1)
-    {
-      argmax <- sample(argmax, 1)
-    }  #if more than one maximums, choose one randomly
-    if (length(argmin) != 1) {
-      argmin <- sample(argmin, 1)
-    }
-    simu_GPS$B[index[1]] <- argmax
-    simu_GPS$R_Bi[index[1]] <- maxvalue
-    simu_GPS$R_Ci[index[1]] <- minvalue
+  if(if.matching.GPS){
+    logistic.formula=formula(paste("A ~ ", paste("X",seq(p),sep = '',collapse = '+'))) #estimate GPS
+    logistic.fit <- multinom(logistic.formula, data = inputdata, trace = F)
     
-    simu_GPS$g_weight[index[1]] <- abs(maxvalue - temp$impute[1]) + abs(maxvalue - temp$impute[2]) + abs(maxvalue - temp$impute[3]) + abs(maxvalue - temp$impute[4])
+    prob.matrix <- fitted(logistic.fit) # each row is (Pr(1|X),..,Pr(K|X))
+    inputdata=cbind(prob.matrix,inputdata,original.order=1:nrow(inputdata)) # the first K column are (Pr(1|X),..,Pr(K|X))
+  } else {
+    inputdata=cbind(inputdata,original.order=1:nrow(inputdata)) # the first K column are (Pr(1|X),..,Pr(K|X))
   }
   
-  #matching result
-  Match.result <- simu_GPS[which(simu_GPS$B != 0), ]
   
-  #matched set 
-  colnames(matchset) <- c(paste("Treatment", trueT1), paste("Treatment", trueT2), paste("Treatment", trueT3), paste("Treatment", trueT4))
-  #adjust the order
-  for (i in 1:K) {
-    matchset[, i] <- simu_GPS$origin_order[matchset[, i]]
+  match.set=matrix(0,nrow = n,ncol=K)
+  
+  colnames(match.set)=1:K
+  
+  for(k in 1:K){
+    # k is the reference group, find the matched set for this group
+    except.k=seq(K)
+    except.k=except.k[except.k!=k] # {1,2,..,(k-1),(k+1),..,K}
+    for(l in except.k){
+      kl.group=inputdata[(inputdata$A==k)|(inputdata$A==l),] # combine k and l groups, for each unit in k, find its matching estimator
+      
+      # matching on GPS/Covariate
+      if(if.matching.GPS){
+        match.kl <- Match(Y = NULL, Tr = kl.group$A==k, X = kl.group[,1:K], ties = FALSE,Weight = 2) # return the matched indexes, but relative to kl.group
+      } else {
+        match.kl <- Match(Y = NULL, Tr = kl.group$A==k, X = kl.group[,1:p], ties = FALSE,Weight = 2) 
+      }
+      
+      match.for.k.treat.l=kl.group$original.order[match.kl[["index.control"]]] # the original order of the matched set
+      k.original.order=kl.group$original.order[match.kl[["index.treated"]]] # original order of k group itself
+      match.set[k.original.order,l]= match.for.k.treat.l
+    }
+    match.set[inputdata$A==k,k]=which(inputdata$A==k) # the matched set for k group relative to k treatment is itself
   }
   
-  return <- list(`reference group` = reference_group, result = Match.result, `match set` = matchset)
+  #treatment w.r.t maximum potential outcome,maximum potential outcome,minimum potential outcome,g1() and g2() weighting function
+  max.trt = R.max.trt=R.min.trt=g.weight1=g.weight2=rep(0,n)
+  potential.outcome=matrix(NA,nrow = n,ncol = K)
+  for(k in 1:K){
+    potential.outcome[,k]=inputdata$impute[match.set[,k]]
+  }
+  R.max.trt=apply(potential.outcome,1,max)
+  R.min.trt=apply(potential.outcome,1,min)
+  max.trt=apply(potential.outcome,1,which.max)
+  g.weight1=apply(R.max.trt-potential.outcome,1,sum)
+  g.weight2=R.max.trt-R.min.trt
+  
+  #delete the original.order column (and estimated GPS)
+  if(if.matching.GPS){
+    inputdata=inputdata[,-c(seq(K),ncol(inputdata))]
+  } else{
+    inputdata=inputdata[,-ncol(inputdata)]
+  }
+  
+  inputdata=cbind(inputdata,match.set,max.trt=max.trt,R.max.trt=R.max.trt,R.min.trt=R.min.trt,g.weight1=g.weight1,g.weight2=g.weight2)
+  
+  return(inputdata)
 }
 
 #misclassification rate
 error.rate <- function(y, fit.class) return(sum(fit.class != y)/length(fit.class))
 
-est_propensity <- function(testing, A) {
-  PS <- switch(as.numeric(A), testing$p1, testing$p2, testing$p3, testing$p4)
-  return(PS)
-}
-
 valuefun <- function(X, R, A, est_ITR, if_test = FALSE) {
-  # Input: covariate, treatment, outcome, estimated ITR
+  # Input: covariate, treatment, outcome(if_test=FALSE,then R is (pseudo) outcome; if_test=TRUE, then R is true outcome(survival time)), estimated ITR
   # Output: value function
-  # When if_test=FLASE, estimate the propensity score by multinomial logistics and imputed outcomes
-  # When calculate the testing performance, set if_test=TRUE and use the true propensity score and true survival time
+  # When if_test=FLASE, this function is used in tuning parameters in CV, it estimates the propensity score by multinomial logistics. Use estimated PS and (pseudo) outcome
+  # When if_test=TRUE, calculate the testing performance. Use the true propensity score and true outcome (if survival data, use true survival time)
   # value function = sum(I[Ai=D(Xi)]Ri/p(Ai,Xi)) / sum(I[Ai=D(Xi)] /p(Ai,Xi))
   
   id <- which(est_ITR == A)
@@ -497,15 +464,19 @@ valuefun <- function(X, R, A, est_ITR, if_test = FALSE) {
   if (if_test == FALSE) {
     # estimate PS
     X <- data.frame(X)
-    colnames(X) <- c("X1", "X2", "X3", "X4", "X5", "X6")
-    fit <- multinom("A~X1+X2+X3+X4+X5+X6", data = cbind(A, X), trace = F)
-    Rx <- fitted(fit)
-    colnames(Rx) <- c("p1", "p2", "p3", "p4")
-    test_PS <- cbind(X, R, A, Rx)
+    colnames(X) <- paste("X",seq(p),sep = '')
+    
+    logistic.formula=formula(paste("A ~ ", paste("X",seq(p),sep = '',collapse = '+')))
+    logistic.fit <- multinom(logistic.formula, data = cbind(A, X), trace = F)
+    prob.matrix <- fitted(logistic.fit) # each row is (Pr(1|X),..,Pr(K|X))
+    prob.A=rep(0, nrow(X)) # vector of Pr(A|X)
+    for(k in 1:K){
+      prob.A[A==k]=prob.matrix[A==k,k]
+    }
     
     denominator <- numerator <- 0
-    for (i in id) denominator <- denominator + 1/est_propensity(test_PS[i, ], test_PS$A[i])
-    for (i in id) numerator <- numerator + test_PS$R[i]/est_propensity(test_PS[i, ], test_PS$A[i])
+    for (i in id) denominator <- denominator + 1/prob.A[i]
+    for (i in id) numerator <- numerator + R[i]/prob.A[i]
     
   } else {
     denominator <- sum(sapply(id, function(i) 1/propensity(A[i], X[i, ])))
@@ -514,7 +485,7 @@ valuefun <- function(X, R, A, est_ITR, if_test = FALSE) {
   return(numerator/denominator)
 }
 
-#cross validation for tuning penalty parameter lambda
+#cross validation for tuning penalty parameter lambda. This function is used for RAMSVM based methods
 cvfun <- function(inputX, inputY, originR, originA, fold = 3, lambda, kernel = "linear", kparam = 1, weight = NA) {
   #X covariate, Y label for MSVM, A original treatment, R: outcome
   set.seed(2021)
@@ -579,11 +550,7 @@ cvfun <- function(inputX, inputY, originR, originA, fold = 3, lambda, kernel = "
   return(list(lambda = lambda[optIndex[1]], kparam = kparam[optIndex[2]], value = ValueFun))
 }
 
-g <- function(x, y) {
-  return(x - y)
-}
-
-#imputation by Cui et al., 2017, Electronic journal of statistics, but not used in the paper
+#imputation by Cui et al., 2017, Electronic journal of statistics
 condition_survival <- function(S.hat, Y.grid) {
   Y.diff <- diff(c(0, Y.grid))
   Q.hat <- matrix(NA, nrow(S.hat), ncol(S.hat))
@@ -596,6 +563,14 @@ condition_survival <- function(S.hat, Y.grid) {
   Q.hat <- sweep(Q.hat, 2, Y.grid, "+") 
   Q.hat[, ncol(Q.hat)] <- tau
   
+  #calculate the integral from the last event time to tau and add it to Q.hat 
+  for(i in 1:nrow(Q.hat)){
+    last_rectangle=(tau-Y.grid[ncol(Q.hat)])*S.hat[i,ncol(Q.hat)]
+    for(j in 1:(ncol(Q.hat)-1)){
+      Q.hat[i,j]=Q.hat[i,j]+last_rectangle/S.hat[i,j]
+    }
+  }
+  
   Q.hat0 <- matrix(expected_survival(S.hat, Y.grid), nrow(S.hat), 1)
   Q.hat <- cbind(Q.hat0, Q.hat)
   return(Q.hat)
@@ -603,40 +578,288 @@ condition_survival <- function(S.hat, Y.grid) {
 
 #imputation E[T|A,X]
 expected_survival <- function(S.hat, Y.grid) {
-  grid.diff <- diff(c(0, Y.grid, max(Y.grid)))
+  grid.diff <- diff(c(0, Y.grid, tau))
   return(c(cbind(1, S.hat) %*% grid.diff))
 }
+
+########################### Functions for AD-learning Qi et al. 2020 ##########################
+encode<-function(A,K){
+  # input one unit's integer treatment A in {1,2,..,K}
+  # output one of the K simplex vertices defined in R^{k-1}
+  if(A==1){
+    return((K-1)^{-1/2}*rep(1,K-1))
+  }else{
+    e_Aminus1=rep(0,K-1)
+    e_Aminus1[A-1]=1
+    return(-(1+sqrt(K))*(K-1)^{-3/2}*rep(1,K-1)+(K/(K-1))^{1/2}*e_Aminus1)
+  }
+}
+
+# accelerated proximal gradient optimization from https://github.com/jpvert/apg
+apg <- function(grad_f, prox_h, dim_x, opts) {
+  
+  # Set default parameters
+  X_INIT <- numeric(dim_x) # initial starting point
+  USE_RESTART <- TRUE # use adaptive restart scheme
+  MAX_ITERS <- 2000 # maximum iterations before termination
+  EPS <- 1e-6 # tolerance for termination
+  ALPHA <- 1.01 # step-size growth factor
+  BETA <- 0.5 # step-size shrinkage factor
+  QUIET <- FALSE # if false writes out information every 100 iters
+  GEN_PLOTS <- TRUE # if true generates plots of norm of proximal gradient
+  USE_GRA <- FALSE # if true uses UN-accelerated proximal gradient descent (typically slower)
+  STEP_SIZE = NULL # starting step-size estimate, if not set then apg makes initial guess
+  FIXED_STEP_SIZE <- FALSE # don't change step-size (forward or back tracking), uses initial step-size throughout, only useful if good STEP_SIZE set
+  
+  # Replace the default parameters by the ones provided in opts if any
+  for (u in c("X_INIT","USE_RESTART", "MAX_ITERS", "EPS", "ALPHA", "BETA", "QUIET", "GEN_PLOTS", "USE_GRA", "STEP_SIZE", "FIXED_STEP_SIZE")) {
+    eval(parse(text=paste('if (exists("',u,'", where=opts)) ',u,' <- opts[["',u,'"]]',sep='')))
+  }
+  
+  # Initialization
+  x <- X_INIT
+  y <- x
+  g <- grad_f(y, opts)
+  if (norm_vec(g) < EPS) {
+    return(list(x=x,t=0))
+  }
+  theta <- 1
+  
+  # Initial step size
+  if (is.null(STEP_SIZE)) {
+    
+    # Barzilai-Borwein step-size initialization:
+    t <- 1 / norm_vec(g)
+    x_hat <- x - t*g
+    g_hat <- grad_f(x_hat, opts)
+    t <- abs(sum( (x - x_hat)*(g - g_hat)) / (sum((g - g_hat)^2)))
+  } else {
+    t <- STEP_SIZE
+  }
+  
+  # Main loop
+  for (k in seq(MAX_ITERS)) {
+    
+    if (!QUIET && (k %% 100==0)) {
+      message(paste('iter num ',k,', norm(tGk): ',err1,', step-size: ',t,sep=""))
+    }
+    
+    x_old <- x
+    y_old <- y
+    
+    # The proximal gradient step (update x)
+    x <- prox_h( y - t*g, t, opts)
+    
+    # The error for the stopping criterion
+    err1 <- norm_vec(y-x) / max(1,norm_vec(x))
+    if (err1 < EPS) break
+    
+    # Update theta for acceleration
+    if(!USE_GRA)
+      theta <- 2/(1 + sqrt(1+4/(theta^2)))
+    else
+      theta <- 1
+    end
+    
+    # Update y
+    if (USE_RESTART && sum((y-x)*(x-x_old))>0) {
+      x <- x_old
+      y <- x
+      theta <- 1
+    } else {
+      y <- x + (1-theta)*(x-x_old)
+    }
+    
+    # New gradient
+    g_old <- g
+    g <- grad_f(y,opts)
+    
+    # Update stepsize by TFOCS-style backtracking
+    if (!FIXED_STEP_SIZE) {
+      t_hat <- 0.5*sum((y-y_old)^2)/abs(sum((y - y_old)*(g_old - g)))
+      t <- min( ALPHA*t, max( BETA*t, t_hat ))
+    }
+  }
+  if (!QUIET) {
+    message(paste('iter num ',k,', norm(tGk): ',err1,', step-size: ',t,sep=""))
+    if (k==MAX_ITERS) message(paste('Warning: maximum number of iterations reached'))
+    message('Terminated')
+  }
+  
+  # Return solution and step size
+  return(list(x=x,t=t))
+}
+
+# proximal operator of group lasso, if no "groups" in opts, then return to L1 lasso
+prox.grouplasso <- function(x, t, opts=list(groups=as.list(seq(length(x))))) {
+  
+  if (!exists("groups",where=opts))
+    stop("No list of groups provided for the group lasso.")
+  ngroups <- length(opts$groups)
+  if (!exists("groupweights",where=opts)) {
+    w <- rep(t, ngroups)
+  } else {
+    if (length(opts[["groupweights"]]) == ngroups) {
+      w <- t*opts[["groupweights"]]
+    } else {
+      w <- t*rep(opts[["groupweights"]][1], ngroups)
+    }
+  }
+  
+  u <- x
+  for (i in seq(ngroups)) {
+    g <- opts[["groups"]][[i]]
+    u[g] <- max(0, 1 - w[i] / norm_vec(x[g]) ) * x[g]
+  }
+  return(u)
+}
+
+norm_vec <- function(x) {
+  sqrt(sum(x^2))
+}
+
+# gradient of negative log partial likelihood of weighted Cox regression in Qi et al.(2020)
+grad.cox<-function(Beta,opts){
+  #parameter to optimize is the Beta vector,opts must contain time, event, prob_A(i.e.,Pr(Ai|Xi)) and X(n*p design matrix)
+  observe_time=opts[['time']]
+  delta=opts[['event']]
+  inverse_prob_A=1/opts[['prob_A']]
+  inverse_prob_A=inverse_prob_A/sum(inverse_prob_A) #normalize the weights to 1 as glmnet. If unweighted, then it is 1/n for each unit.
+  X=opts[['X']]
+  n=length(observe_time) #total sample size
+  
+  score_Beta=0
+  
+  for(i in 1:n){
+    if(delta[i]==1){
+      score_Beta1=-X[i,]
+      
+      ind_Risk=as.numeric(observe_time>=observe_time[i]) # indicator for risk set, i.e., the risk set at this time
+      denominator=sum(exp(X%*%Beta)*ind_Risk)
+      w_ji=exp(X%*%Beta)/denominator # w_ji=exp(x_j*beta)/sum_{l:Y_l>=Y_i} exp(x_l*beta), but this is actually n-dimensional vector
+      
+      w_ji_X=vecmat(as.vector(w_ji),X) # vecmat is equivalent to diag(as.vector(w_ji))%*%X, but extremely faster
+      score_Beta2=apply(vecmat(ind_Risk,w_ji_X),2,sum) #sum_{j:Y_j>=Y_i} w_ji*x_j
+      
+      score_Beta=score_Beta+inverse_prob_A[i]*(score_Beta1+score_Beta2) 
+    }
+  }
+  return(score_Beta)
+}
+
+# AD-learning for survival data
+ADlearning.surv<-function(time,event,A,X,prob_A,groups=split(1:(p*(K-1)),1:p),lambda){
+  # time,event,A,prob_A are n*1 vectors, where A is treatment,X is design matrix, prob_A is Pr(A|X). 
+  # groups is a list of indexes. it is corresponding to modified.covariate
+  # return the coefficient matrix
+  if(length(unique(A))!=K) return("Treatment vector A is not {1,2,..,K}")
+  n=length(time) #n is the sample size of input data
+  p=ncol(X)
+  
+  modified.covariate=matrix(NA,nrow = n,ncol=p*(K-1)) # modified.covariate is the matrix of xw^T after vectorized, resulting in n*(p*(K-1)) matrix.
+  for(i in 1:n){
+    modified.matrix=matrix(X[i,],ncol = 1)%*%matrix(encode(A[i],K),nrow=1) #xw^T,p*(K-1) matrix
+    modified.covariate[i,]=matrix(modified.matrix,nrow = 1) #vectorized by column order, i.e., the first p covariates denote the first column of xw^T
+  }
+  
+  #coefficient matrix B (p*(K-1)), but it is vectorized by column order. The first p coefficients denote the first column of B
+  Bhat=apg(grad.cox,prox.grouplasso,dim_x = dim(modified.covariate)[2],opts = list(time=time,event=event,X=modified.covariate,prob_A=prob_A,
+                                                                                     groups=groups,groupweights=lambda,QUIET=TRUE))$x
+  Bhat=matrix(Bhat,nrow = p)
+  return(Bhat)
+}
+
+cv.ADlearning.surv <- function(inputdata,prob.A,w.k.matrix,lambda,fold=3) {
+# lambda should be a vector. Find the optimal lambda that maximize the empirical value function
+  set.seed(2021)
+  folds <- createFolds(prob.A, k = fold)
+  ValueFun <- rep(0,length(lambda)) 
+  
+  for (i in 1:fold) {
+    cat("Leaving subset[", i, "] out in", fold, "fold CV:", "\n")
+    inputdata_in=inputdata[-folds[[i]],]
+    inputdata_out=inputdata[folds[[i]],]
+    prob.A_in=prob.A[-folds[[i]]]
+    
+    for (j in 1:length(lambda)) {
+        Bhat=ADlearning.surv(time = inputdata_in$R,event = inputdata_in$censor,A = inputdata_in$A,X = as.matrix(inputdata_in[,1:p]),prob_A = prob.A_in,lambda = lambda[j])
+        # optimal ITR is argmin w_k^T*B^T*x. The matrix XBW is n*K, the ij element is x_i^T*B*w_j
+        AD.pred.matrix=as.matrix(inputdata_out[,1:p])%*%Bhat%*%w.k.matrix
+        fit.class=apply(AD.pred.matrix,MARGIN = 1,which.min)
+        ValueFun[j] <- ValueFun[j] + valuefun(X = as.matrix(inputdata_out[,1:p]), R = inputdata_out$impute, A = inputdata_out$A, est_ITR = fit.class)/fold
+        cat("*")
+      }
+    cat("\n")
+    }
+
+  optIndex <- which.max(ValueFun) 
+  return(list(lambda = lambda[optIndex], value = ValueFun))
+}
+
+#######################################################################################
+
+# # tuning parameter by empirical pseudo value function in Q learning
+# cv.Qlearning.surv <- function(Qlearnformula,Qlearndata,Ql.weight,alpha = 1,lambda,fold=3) {
+#   # Qlearndata is the same as inputdata except for the factor A, the weight is the inverse censoring weight, lambda should be a vector. Find the optimal lambda that maximize the empirical pseudo value function
+#   set.seed(2021)
+#   folds <- createFolds(Ql.weight, k = fold)
+#   ValueFun <- rep(0,length(lambda))
+#   Ql.modelmat=model.matrix(Qlearnformula,Qlearndata)[,-1] #first introduce the interactions
+#   
+#   for (i in 1:fold) {
+#     cat("Leaving subset[", i, "] out in", fold, "fold CV:", "\n")
+#     Ql.modelmat_in=Ql.modelmat[-folds[[i]],]
+#     Ql.weight_in=Ql.weight[-folds[[i]]]
+#     Qlearndata_out=Qlearndata[folds[[i]],]
+# 
+#     for (j in 1:length(lambda)) {
+#       Qlearn.res=glmnet(x = Ql.modelmat_in,y = Qlearndata$R[-folds[[i]]],family='gaussian',weights = Ql.weight_in,alpha = alpha, lambda=lambda[j])
+#       
+#       Qlearn.newdata=Qlearndata_out[rep(1:nrow(Qlearndata_out),K),1:p] #construct the big matrix, if only one factor in data, the model.matrix will go wrong
+#       Qlearn.newdata$A=rep(1:K,each=nrow(Qlearndata_out))
+#       Qlearn.newdata$A=factor(Qlearn.newdata$A)
+#       Ql.model.newmat=model.matrix(Qlearnformula,Qlearn.newdata)[,-1] 
+#       Qlearn.pred.matrix=matrix(predict(Qlearn.res,Ql.model.newmat),nrow = nrow(Qlearndata_out),byrow = F) 
+#       
+#       fit.class <- apply(Qlearn.pred.matrix, 1, which.max) # the optimal ITR
+# 
+#       ValueFun[j] <- ValueFun[j] + valuefun(X = as.matrix(Qlearndata_out[,1:p]), R = Qlearndata_out$impute, A = Qlearndata_out$A, est_ITR = fit.class)/fold
+#       cat("*")
+#     }
+#     cat("\n")
+#   }
+# 
+#   optIndex <- which.max(ValueFun)
+#   return(list(lambda = lambda[optIndex], value = ValueFun))
+# }
+
+###############################################################################################
 
 #all the comparing methods
 parAllmethod <- function(ii, decision_boundary = "linear", outcome_model = "simple") {
   sink(paste0(ii, ".txt"))
-  performance <- matrix(0, 2, 7)
+  performance <- matrix(0, 2, 11)
   
-  #we consider correct propensity model and Gaussian kernel
   rownames(performance) <- c("value fun", "error rate")
-  colnames(performance) <- c("gaussian g1", "gaussian gweight1", "gaussian gweight2", "augment owl", "gaussian owl", "cox", "weighted cox")
+  colnames(performance) <- c("Match-g1-cov","Match-g1-gps","Match-gw1-cov","Match-gw1-gps","Match-gw2-cov","Match-gw2-gps","Multi-AOL", "Multi-OL", "Cox","Q-learning",'AD-learning')
   
-  train <- getdata(n = n, p, seed = this.seed + ii, decision_boundary = decision_boundary, outcome_model = outcome_model)
-  testing <- test_data(n = 20000, decision_boundary = decision_boundary, outcome_model = outcome_model)
-  names <- rep(0, p)
-  for (i in 1:p) {
-    names[i] <- paste("X", i, sep = "")
-  }  
-  #define colnames for coxph
-  colnames(train)[1:p] <- colnames(testing)[1:p] <- names
+  train <- getdata(n = n, p = p, seed = this.seed + ii, decision_boundary = decision_boundary, outcome_model = outcome_model)
+  testing <- test_data(n = n.test, decision_boundary = decision_boundary, outcome_model = outcome_model)
+
+  colnames(train)[1:p] <- colnames(testing)[1:p] <- paste('X',seq(p),sep='')
   
   #only covariate, censor, observed time and treatment
-  simudata <- train[, -c((dim(train)[2] - 1), dim(train)[2])]
+  inputdata <- train[, -c((dim(train)[2] - 1), dim(train)[2])]
   
   # fitting random survival forest
-  rsf_fit <- rfsrc(Surv(R, censor) ~ ., data = simudata, block.size = 1)
+  rsf_fit <- rfsrc(Surv(R, censor) ~ ., data = inputdata, block.size = 1)
   
-  #calculate imputation by Cui et al., 2017, but not used in the paper
-  Q.hat <- condition_survival(S.hat = rsf_fit$survival.oob[which(simudata$censor == 0), ], Y.grid = rsf_fit$time.interest)
+  #calculate imputation by Cui et al., 2017
+  Q.hat <- condition_survival(S.hat = rsf_fit$survival.oob[which(inputdata$censor == 0), ], Y.grid = rsf_fit$time.interest)
   impute_all <- rep(NA, nrow(Q.hat))
-  Y <- simudata[which(simudata$censor == 0), ]$R 
+  Y <- inputdata[which(inputdata$censor == 0), ]$R 
   for (i in 1:nrow(Q.hat)) {
-    Y.index <- findInterval(Y[i], rsf_fit$time.interest, rightmost.closed = T) + 1
+    Y.index <- findInterval(Y[i], rsf_fit$time.interest) + 1
     Q.Y.hat <- Q.hat[i, Y.index]
     impute_all[i] <- Q.Y.hat
   }
@@ -644,111 +867,28 @@ parAllmethod <- function(ii, decision_boundary = "linear", outcome_model = "simp
   #imputation by RSF
   impute_R1 <- expected_survival(S.hat = rsf_fit$survival.oob, Y.grid = rsf_fit$time.interest)
   
-  Trt <- c(rep("Treatment 1", n/K), rep("Treatment 2", n/K), rep("Treatment 3", n/K), rep("Treatment 4", n/K))
-  simu <- cbind(simudata[, -dim(simudata)[2]], imputeR1 = impute_R1, imputeR2 = simudata$R, treat = Trt)
-  simu$imputeR2[which(simudata$censor == 0)] <- impute_all
-  
-  #we use the imputation by RSF in the paper, and only replace the censored observations, i.e. R*=ΔT+(1-Δ)E(T|A,X)
-  simu <- cbind(simu, impute = simu$imputeR1)
-  simu$impute[which(simudata$censor == 1)] <- simu$R[which(simudata$censor == 1)] 
-  
-  #adjust the data structure for Matching
-  simu <- simu[, -((p + 1):(dim(simu)[2] - 2))]
-  
-  remove(simudata)
-  
-  ###############Standard Cox model#####################
-  Coxdata <- train
-  Coxdata$A <- factor(Coxdata$A)
-  
-  cox_model <- coxph(Surv(R, censor) ~ (X1 + X2 + X3 + X4 + X5 + X6) * (A), data = Coxdata, method = "breslow", eps = 1e-07, iter.max = 20)
-  
-  testA1 <- data.frame(testing[, 1:p], A = factor(rep(1, 20000)))
-  testA2 <- data.frame(testing[, 1:p], A = factor(rep(2, 20000)))
-  testA3 <- data.frame(testing[, 1:p], A = factor(rep(3, 20000)))
-  testA4 <- data.frame(testing[, 1:p], A = factor(rep(4, 20000)))
-  
-  cox_result <- matrix(rep(0, 20000 * 4), ncol = 4)
-  dimnames(cox_result) <- list(1:20000, 1:4)
-  cox_result[, 1] <- predict(cox_model, testA1, type = "risk")
-  cox_result[, 2] <- predict(cox_model, testA2, type = "risk")
-  cox_result[, 3] <- predict(cox_model, testA3, type = "risk")
-  cox_result[, 4] <- predict(cox_model, testA4, type = "risk")
-  
-  predict_ITR <- as.numeric(apply(cox_result, 1, function(t) colnames(cox_result)[which.min(t)]))
-  
-  performance[1, 6] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = predict_ITR, if_test = TRUE)
-  performance[2, 6] <- error.rate(y = testing$optA, fit.class = predict_ITR)
-  cat("standard cox over!", "\n")
-  
-  ###############Weighted Cox model#####################
-  #estimated generalized propensity score
-  fit <- multinom(A ~ X1 + X2 + X3 + X4 + X5 + X6, data = Coxdata, trace = F)
-  Rx <- fitted(fit)
-  colnames(Rx) <- c("p1", "p2", "p3", "p4")
-  Coxdata_GPS <- cbind(Coxdata, Rx)
-  
-  #storage weights
-  for (i in 1:n) {
-    if (Coxdata_GPS[i, ]$A == "1")
-      Coxdata_GPS$weight[i] <- Coxdata_GPS$p1[i]
-    if (Coxdata_GPS[i, ]$A == "2")
-      Coxdata_GPS$weight[i] <- Coxdata_GPS$p2[i]
-    if (Coxdata_GPS[i, ]$A == "3")
-      Coxdata_GPS$weight[i] <- Coxdata_GPS$p3[i]
-    if (Coxdata_GPS[i, ]$A == "4")
-      Coxdata_GPS$weight[i] <- Coxdata_GPS$p4[i]
+  if(if.imputeR2){
+    inputdata <- cbind(inputdata, impute = inputdata$R) #imputed by delta*T+(1-delta)*E(tildeT|A,X,tildeT>T,T)
+    inputdata$impute[which(inputdata$censor == 0)] <- impute_all
+  } else {
+    inputdata <- cbind(inputdata, impute = impute_R1) #imputed by E(T|A,X)
   }
-  
-  cox_GPS_model <- coxph(Surv(R, censor) ~ (X1 + X2 + X3 + X4 + X5 + X6) * (A), data = Coxdata_GPS, weights = weight)
-  
-  cox_result[, 1] <- predict(cox_GPS_model, testA1, type = "risk")
-  cox_result[, 2] <- predict(cox_GPS_model, testA2, type = "risk")
-  cox_result[, 3] <- predict(cox_GPS_model, testA3, type = "risk")
-  cox_result[, 4] <- predict(cox_GPS_model, testA4, type = "risk")
-  
-  predict_ITR <- as.numeric(apply(cox_result, 1, function(t) colnames(cox_result)[which.min(t)]))
-  
-  performance[1, 7] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = predict_ITR, if_test = TRUE)
-  performance[2, 7] <- error.rate(y = testing$optA, fit.class = predict_ITR)
-  cat("weighted cox owl over!", "\n")
-  
-  remove(Coxdata, testA1, testA2, testA3, testA4, cox_model, cox_GPS_model, cox_result)
-  
-  
-  ############## augmented owl ################
-  trt.owlmd <- owl.md(X = as.matrix(simu[, 1:p]), R = as.matrix(simu[, dim(simu)[2]]), A = train$A, testX = as.matrix(testing[, 1:p]))
-  performance[1, 4] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = trt.owlmd, if_test = TRUE)
-  performance[2, 4] <- error.rate(y = testing$optA, fit.class = trt.owlmd)
-  cat("augmented owl over!", "\n")
-  
-  
+
+  #inputdata contains: X1,..,Xp,censor,R(observed outcome),A,impute(for continuous outcome, it is the same as R)
+
   ############### Match+ramsvm based methods############
-  
-  #Matching first
-  
-  simu_GPS <- cbind(simu, origin_order = 1:nrow(simu))
-  
-  #Matching result
-  MultiMtrt1 <- MultiMatch(1, simu_GPS, calipernum)
-  MultiMtrt2 <- MultiMatch(2, simu_GPS, calipernum)
-  MultiMtrt3 <- MultiMatch(3, simu_GPS, calipernum)
-  MultiMtrt4 <- MultiMatch(4, simu_GPS, calipernum)
-  cat("Match over!", "\n")
-  remove(simu_GPS)
-  
   ##for calculate valuefun, here originR is the imputation
-  originR <- rbind(as.matrix(simu$impute[MultiMtrt1$`match set`[, 1]]), as.matrix(simu$impute[MultiMtrt2$`match set`[, 1]]), 
-                   as.matrix(simu$impute[MultiMtrt3$`match set`[, 1]]), as.matrix(simu$impute[MultiMtrt4$`match set`[,1]]))
-  originA <- as.matrix(rep(c(1, 2, 3, 4), c(length(MultiMtrt1$result$impute), length(MultiMtrt2$result$impute), length(MultiMtrt3$result$impute), length(MultiMtrt4$result$impute))))
-  
-  
-  #########################gaussian g1##########################################
+  originR <- as.matrix(inputdata$impute)
+  originA <- as.matrix(inputdata$A)
+
+  ######################## Covariate matching g1############################################
+  #Multiple treatment matching, return inputdata with additional information
+  match.cov.res=MultiMatchGeneral(inputdata = inputdata, if.matching.GPS = FALSE)
+
   #train
-  inputX <- rbind(MultiMtrt1$result[, 1:6], MultiMtrt2$result[, 1:6], MultiMtrt3$result[, 1:6], MultiMtrt4$result[, 1:6])
-  inputX <- as.matrix(inputX)
-  inputY <- rbind(as.matrix(MultiMtrt1$result$B), as.matrix(MultiMtrt2$result$B), as.matrix(MultiMtrt3$result$B), as.matrix(MultiMtrt4$result$B))
-  
+  inputX <- as.matrix(inputdata[,1:p]) #use X1,..,Xp to fit the ITR
+  inputY <- as.matrix(match.cov.res$max.trt) #the treatment of maximum potential outcome as the label
+
   cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian")
   ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian"), TRUE)
   if (is.character(ramsvm.out)) {
@@ -759,12 +899,12 @@ parAllmethod <- function(ii, decision_boundary = "linear", outcome_model = "simp
   performance[1, 1] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
   performance[2, 1] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
   cat("gaussian g1 over!", "\n")
-  
-  
-  #########################gaussian  gweight1##########################################
+
+
+  ######################### Covariate matching gweight1#####################################
   #weight by g1()
-  msvm_weight <- as.matrix(c(MultiMtrt1$result$g_weight, MultiMtrt2$result$g_weight, MultiMtrt3$result$g_weight, MultiMtrt4$result$g_weight))
-  
+  msvm_weight <- as.matrix(match.cov.res$g.weight1)
+
   cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
   ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
   if (is.character(ramsvm.out)) {
@@ -772,14 +912,422 @@ parAllmethod <- function(ii, decision_boundary = "linear", outcome_model = "simp
   }
   #prediction on test data
   fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+  performance[1, 3] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
+  performance[2, 3] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
+  cat("gaussian gweight1 over!", "\n")
+
+
+  ######################## Covariate matching gweight2#######################################
+  #weight by g2()
+  msvm_weight <- as.matrix(match.cov.res$g.weight2)
+
+  cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+  ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
+  if (is.character(ramsvm.out)) {
+    return("gaussian MSVM gweight2 failed")
+  }
+  #prediction on test data
+  fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+  performance[1, 5] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
+  performance[2, 5] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
+  cat("gaussian gweight2 over!", "\n")
+
+
+  ######################## GPS matching g1############################################
+  #Multiple treatment matching, return inputdata with additional information
+  match.gps.res=MultiMatchGeneral(inputdata = inputdata, if.matching.GPS = TRUE)
+
+  #train
+  inputX <- as.matrix(inputdata[,1:p]) #use X1,..,Xp to fit the ITR
+  inputY <- as.matrix(match.gps.res$max.trt) #the treatment of maximum potential outcome as the label
+
+  cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian")
+  ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian"), TRUE)
+  if (is.character(ramsvm.out)) {
+    return("gaussian MSVM g1 failed")
+  }
+  #prediction on test data
+  fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
   performance[1, 2] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
   performance[2, 2] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
+  cat("gaussian g1 over!", "\n")
+
+
+  ######################### GPS matching gweight1#####################################
+  #weight by g1()
+  msvm_weight <- as.matrix(match.gps.res$g.weight1)
+
+  cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+  ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
+  if (is.character(ramsvm.out)) {
+    return("gaussian MSVM gweight1 failed")
+  }
+  #prediction on test data
+  fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+  performance[1, 4] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
+  performance[2, 4] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
   cat("gaussian gweight1 over!", "\n")
-  
-  
-  #########################gaussian gweight2##########################################
+
+
+  ######################## GPS matching gweight2#######################################
   #weight by g2()
-  msvm_weight <- as.matrix(c(g(MultiMtrt1$result$R_Bi, MultiMtrt1$result$R_Ci), g(MultiMtrt2$result$R_Bi, MultiMtrt2$result$R_Ci), g(MultiMtrt3$result$R_Bi, MultiMtrt3$result$R_Ci), g(MultiMtrt4$result$R_Bi, MultiMtrt4$result$R_Ci)))
+  msvm_weight <- as.matrix(match.gps.res$g.weight2)
+
+  cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+  ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
+  if (is.character(ramsvm.out)) {
+    return("gaussian MSVM gweight2 failed")
+  }
+  #prediction on test data
+  fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+  performance[1, 6] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
+  performance[2, 6] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
+  cat("gaussian gweight2 over!", "\n")
+
+
+  ############## Augmented OWL ################
+  trt.owlmd <- owl.md(X = as.matrix(inputdata[, 1:p]), R = as.matrix(inputdata$impute), A = inputdata$A, testX = as.matrix(testing[, 1:p]))
+  performance[1, 7] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = trt.owlmd, if_test = TRUE)
+  performance[2, 7] <- error.rate(y = testing$optA, fit.class = trt.owlmd)
+  cat("augmented owl over!", "\n")
+
+
+
+  ############### OWL #####################
+  inputY <- as.matrix(inputdata$A) #here, the imputY is the treatment A, used as label
+  logistic.formula=formula(paste("A ~ ", paste("X",seq(p),sep = '',collapse = '+')))
+  logistic.fit <- multinom(logistic.formula, data = inputdata, trace = F)
+
+  prob.matrix <- fitted(logistic.fit) # each row is (Pr(1|X),..,Pr(K|X))
+  prob.A=rep(0, n) # vector of Pr(A|X)
+  for(k in 1:K){
+    prob.A[inputdata$A==k]=prob.matrix[inputdata$A==k,k]
+  }
+
+  #weight for owl, Ri/Pr(Ai|Xi). If min(R)<0, we should use R<- R-min(R) to handle the negative outcome. However, in our simulation it is always positive.
+  msvm_weight <- as.matrix(inputdata$impute/prob.A)
+
+  cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+  ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = msvm_weight), TRUE)
+  if (is.character(ramsvm.out)) {
+    return("gaussian owl failed")
+  }
+  #prediction on test data
+  fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+  performance[1, 8] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
+  performance[2, 8] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
+  cat("gaussian owl over!", "\n")
+  
+  remove(inputX,inputY,originR,originA,match.cov.res,match.gps.res,msvm_weight,logistic.fit)
+  
+  
+  ############### Cox model #####################
+  Coxdata <- inputdata
+  Coxdata$A <- factor(Coxdata$A)
+  Cox.formula= formula(paste("Surv(R,censor) ~ (A) * (", paste("X",seq(p),sep = '',collapse = '+'),')')) # Cox regression on (X,A,XA)
+  cox_model <- coxph(formula = Cox.formula, data = Coxdata, method = "breslow", eps = 1e-07, iter.max = 20)
+
+  cox_result=matrix(0,nrow = n.test,ncol = K) # the risk score of each treatment
+  for(k in 1:K){
+    test_Coxdf <- data.frame(testing[, 1:p], A = factor(rep(k, n.test)))
+    cox_result[, k] <- predict(cox_model, test_Coxdf, type = "risk")
+  }
+  predict_ITR <- apply(cox_result, 1, which.min) # the optimal ITR is that with minimum risk score
+
+  performance[1, 9] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = predict_ITR, if_test = TRUE)
+  performance[2, 9] <- error.rate(y = testing$optA, fit.class = predict_ITR)
+  cat("standard cox over!", "\n")
+
+  remove(Coxdata, Cox.formula, cox_model,cox_result,test_Coxdf)
+  
+  ################ Q-learning with censored data ######################
+  #L1/Elastic-Net penalty linear regression of log(R) on (1,A,X,AX) adjusted with censor weighting, where we introduce dummy variable for A
+  #similar argument as Zhao et al.(2015) Doubly robust learning for estimating individualized treatment with censored data
+  #estimate censor distribution by cox model
+  CensorCoxdata <- inputdata[,-ncol(inputdata)]
+  CensorCoxdata$A <- factor(CensorCoxdata$A)
+  CensorCoxdata$censor <- 1-CensorCoxdata$censor
+  CensorCox.formula= formula(paste("Surv(R,censor) ~ (A)*(", paste("X",seq(p),sep = '',collapse = '+'),')')) # Cox regression on (X,A,XA)
+  Censorcox_model <- coxph(formula = CensorCox.formula, data = CensorCoxdata, method = "breslow", eps = 1e-07, iter.max = 20)
+  
+  CensorSurvfun=rep(1,n) #S(Ri|Xi,Ai) for delta_i=1.
+  for(i in which(inputdata$censor==1)){
+    surfun=survfit(Censorcox_model,newdata = CensorCoxdata[i,]) #survival function of C given (A,X)
+    CensorSurvfun[i]=surfun$surv[findInterval(CensorCoxdata$R[i],surfun$time)]
+  }
+  remove(CensorCoxdata,CensorCox.formula,Censorcox_model,surfun)
+  
+  # # fitting random survival forest
+  # CensorCoxdata <- inputdata[,-ncol(inputdata)]
+  # CensorCoxdata$A <- factor(CensorCoxdata$A)
+  # Censor_rsf_fit <- rfsrc(Surv(R, censor) ~ ., data = CensorCoxdata, block.size = 1)
+  # CensorSurvfun=rep(NA,n) #S(Ri|Xi,Ai) for delta_i=1
+  # for(i in which(inputdata$censor==1)){
+  #   CensorSurvfun[i]=Censor_rsf_fit$survival.oob[i,findInterval(CensorCoxdata$R[i],Censor_rsf_fit$time.interest)]
+  # }
+  # CensorSurvfun=CensorSurvfun[inputdata$censor==1]
+  
+  
+  Qlearndata = inputdata
+  Qlearndata$A=factor(Qlearndata$A) #factor for generating the interactions
+  Qlearndata$R=log(Qlearndata$R+0.00001)
+  Ql.weight=inputdata$censor/CensorSurvfun
+  
+  #generate the interaction terms by hand. Here we use -1 to exclude the first column since it is 1 vector, in glmnet it automatically includes the intercept
+  Qlearnformula=formula(paste("~ (A)*(", paste("X",seq(p),sep = '',collapse = '+'),')'))
+  Ql.modelmat=model.matrix(Qlearnformula,Qlearndata)[,-1] 
+
+  Qlearn.res=cv.glmnet(x = Ql.modelmat,y=Qlearndata$R,family='gaussian',weights = Ql.weight,alpha = 1) #find the largest lambda first
+  # coef(Qlearn.res)
+  
+  # Qlearn_lambda_max=Qlearn.res$lambda[1] # the maximum lambda that all zero except for intercept term
+  # Qlearn_lambda_min_ratio <- 0.01
+  # Qlearn_lambda_seq_length <- 10
+  # Qlearn_lambda_seq= Qlearn_lambda_max * exp(seq(0, log(Qlearn_lambda_min_ratio), length.out = Qlearn_lambda_seq_length))
+
+  # cv.QL.res=cv.Qlearning.surv(Qlearnformula = Qlearnformula,Qlearndata = Qlearndata,Ql.weight = Ql.weight,alpha = 1,lambda = Qlearn_lambda_seq)
+  
+  # Qlearn.res=glmnet(x = Ql.modelmat,y=Qlearndata$R,family='gaussian',weights = Ql.weight,alpha = 1,lambda=cv.QL.res$lambda) #tune lambda by empirical pseudo value function
+  Qlearn.res=glmnet(x = Ql.modelmat,y=Qlearndata$R,family='gaussian',weights = Ql.weight,alpha = 1,lambda=Qlearn.res$lambda.min) #tune lambda by cv.glmnet
+  
+  Qlearn.newdata=testing[rep(1:n.test,K),1:p] #construct the big matrix, if only one factor in data, the model.matrix will go wrong
+  Qlearn.newdata=cbind(Qlearn.newdata,A=rep(1:K,each=n.test))
+  Qlearn.newdata$A=factor(Qlearn.newdata$A)
+  Ql.model.newmat=model.matrix(Qlearnformula,Qlearn.newdata)[,-1] 
+  
+  Qlearn.pred.matrix=matrix(predict(Qlearn.res,Ql.model.newmat),nrow = n.test,byrow = F) #each row is the prediction of Q-learning
+  
+  predict_ITR <- apply(Qlearn.pred.matrix, 1, which.max) # the optimal ITR
+
+  performance[1, 10] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = predict_ITR, if_test = TRUE)
+  performance[2, 10] <- error.rate(y = testing$optA, fit.class = predict_ITR)
+  cat("Q-learning over!", "\n")
+  
+  remove(Qlearndata,Qlearnformula,Ql.weight,Qlearn.res,predict_ITR,Qlearn.pred.matrix,Qlearn.newdata,Ql.modelmat,Ql.model.newmat)
+  
+  ######################### AD-learning ################################
+  # See Equation (28) in Qi et al.(2020) Multi-Armed Angle-Based Direct Learning for Estimating Optimal Individualized Treatment Rules With Various Outcomes for details
+  AD_lambda_max=1
+  AD_lambda_min_ratio <- 0.01
+  AD_lambda_seq_length <- 5
+  
+  #similar as glmnet, find the maximum lambda that all the coefficients are zero
+  flag <- FALSE
+  repeat { 
+    coef <- ADlearning.surv(time = inputdata$R,event = inputdata$censor,A = inputdata$A,X = as.matrix(inputdata[,1:p]),prob_A = prob.A,lambda = AD_lambda_max)
+    if(all(abs(coef) < 1e-5)) { # search downward
+      if(flag) { break }
+      AD_lambda_max <- AD_lambda_max / 2
+    } else { # search upward
+      flag <- TRUE
+      AD_lambda_max <- AD_lambda_max * 2
+    }
+  }
+  AD_lambda_seq= AD_lambda_max * exp(seq(0, log(AD_lambda_min_ratio), length.out = AD_lambda_seq_length))
+  
+  w.k.matrix<-matrix(0,nrow=K-1,ncol = K) #each column is w_k, (K-1)-dimensional vector
+  for(k in 1:K) w.k.matrix[,k]=encode(k,K)
+  
+  #find the optimal lambda and the Bhat
+  cv.AD.res=cv.ADlearning.surv(inputdata = inputdata,prob.A = prob.A,w.k.matrix=w.k.matrix,lambda = AD_lambda_seq) 
+  Bhat.opt=ADlearning.surv(time = inputdata$R,event = inputdata$censor,A = inputdata$A,X = as.matrix(inputdata[,1:p]),prob_A = prob.A,lambda = cv.AD.res$lambda)
+  
+  AD.pred.matrix=as.matrix(testing[,1:p])%*%Bhat.opt%*%w.k.matrix
+  predict_ITR=apply(AD.pred.matrix,MARGIN = 1,which.min)
+  
+  performance[1, 11] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = predict_ITR, if_test = TRUE)
+  performance[2, 11] <- error.rate(y = testing$optA, fit.class = predict_ITR)
+  cat("AD-learning over!", "\n")
+  
+  sink()
+  
+  return(performance)
+}
+
+
+##############Implementation: correct PS model 1 * survival model 2 * decision_boundary 2 * outcome_model 2 = 8 scenarios#########################
+
+outcome_setting_list=c('coxph2','lognormal')
+decision_boundary_list=c("linear","nolinear")
+outcome_model_list=c("simple","nosimple")
+
+for(outcome_setting in outcome_setting_list){
+  if (outcome_setting == "coxph") {
+    tau <- tau_coxph
+    theta <- theta_coxph
+  } else if (outcome_setting == "coxph2") {
+    tau <- tau_coxph2
+    theta <- theta_coxph2
+  } else {
+    tau <- tau_lognormal
+    theta <- theta_lognormal
+  }
+  
+  for(decision_boundary in decision_boundary_list){
+    for(outcome_model in outcome_model_list){
+      
+      sfInit(parallel = TRUE, cpus = 70)
+      sfExportAll()
+      sfLibrary(MASS)
+      sfLibrary(mnormt)
+      sfLibrary(nnet)
+      sfLibrary(e1071)
+      sfLibrary(LaplacesDemon)
+      sfLibrary(Matching)
+      sfLibrary(dplyr)
+      sfLibrary(cluster)
+      sfLibrary(ramsvm)
+      sfLibrary(caret)
+      sfLibrary(survival)
+      sfLibrary(randomForestSRC)
+      sfLibrary(glmnet)
+      # sfLibrary(glmnetUtils)
+      sfLibrary(statmod)
+      pararesult <- sfClusterApplyLB(1:400, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
+      sfStop()
+      save(pararesult, file = paste(outcome_setting, decision_boundary, outcome_model, ".Rdata", sep = ""))
+    }
+  }
+}
+
+
+
+
+################### Additional simulation: additional weight ################################
+##### we run the original setting in the manuscript #####
+# as pointed out by one reviewer, in this version, gweight3 denotes the weight with largest outcome minus second largest outcome
+MultiMatchGeneral<-function(inputdata,if.matching.GPS=FALSE){
+  #Multiple treatment matching with covariate/GPS for continuous/survival outcome, Mahalanobis distance is used
+  #input inputdata includes: X1,..,Xp,censor,R(observed outcome,but actually not used in this function),
+  #A(must take value in seq(K)),impute(for continuous outcome, it is the same as R). The first p columns inputdata[,1:p] should be X1,..,Xp that used for matching (or estimating GPS if.matching.GPS=TRUE)
+  #output original inputdata with additional information: matched set,weight,the treatment w.r.t. the maximum potential outcome, and the maximum and minimum potential outcomes
+  if(length(unique(inputdata$A))!=K) return("Treatment vector A is not {1,2,..,K}")
+  
+  n=nrow(inputdata) # sample size
+  
+  if(if.matching.GPS){
+    logistic.formula=formula(paste("A ~ ", paste("X",seq(p),sep = '',collapse = '+'))) #estimate GPS
+    logistic.fit <- multinom(logistic.formula, data = inputdata, trace = F)
+    
+    prob.matrix <- fitted(logistic.fit) # each row is (Pr(1|X),..,Pr(K|X))
+    # for(i in 1:n){for(j in 1:K){ prob.matrix[i,j]=propensity(j,as.matrix(inputdata[i,1:p]))}} # test using true GPS
+    inputdata=cbind(prob.matrix,inputdata,original.order=1:nrow(inputdata)) # the first K column are (Pr(1|X),..,Pr(K|X))
+  } else {
+    inputdata=cbind(inputdata,original.order=1:nrow(inputdata)) # the first K column are (Pr(1|X),..,Pr(K|X))
+  }
+  
+  
+  match.set=matrix(0,nrow = n,ncol=K)
+  
+  colnames(match.set)=1:K
+  
+  for(k in 1:K){
+    # k is the reference group, find the matched set for this group
+    except.k=seq(K)
+    except.k=except.k[except.k!=k] # {1,2,..,(k-1),(k+1),..,K}
+    for(l in except.k){
+      kl.group=inputdata[(inputdata$A==k)|(inputdata$A==l),] # combine k and l groups, for each unit in k, find its matching estimator
+      
+      # matching on GPS/Covariate
+      if(if.matching.GPS){
+        match.kl <- Match(Y = NULL, Tr = kl.group$A==k, X = kl.group[,1:K], ties = FALSE,Weight = 2) # return the matched indexes, but relative to kl.group
+      } else {
+        match.kl <- Match(Y = NULL, Tr = kl.group$A==k, X = kl.group[,1:p], ties = FALSE,Weight = 2) 
+      }
+      
+      match.for.k.treat.l=kl.group$original.order[match.kl[["index.control"]]] # the original order of the matched set
+      k.original.order=kl.group$original.order[match.kl[["index.treated"]]] # original order of k group itself
+      match.set[k.original.order,l]= match.for.k.treat.l
+    }
+    match.set[inputdata$A==k,k]=which(inputdata$A==k) # the matched set for k group relative to k treatment is itself
+  }
+  
+  #treatment w.r.t maximum potential outcome,maximum potential outcome,minimum potential outcome,g1() and g2() weighting function
+  max.trt = R.max.trt=R.min.trt=R.secondmax.trt=g.weight1=g.weight2=g.weight3=rep(0,n)
+  potential.outcome=matrix(NA,nrow = n,ncol = K)
+  for(k in 1:K){
+    potential.outcome[,k]=inputdata$impute[match.set[,k]]
+  }
+  R.max.trt=apply(potential.outcome,1,max)
+  R.min.trt=apply(potential.outcome,1,min)
+  max.trt=apply(potential.outcome,1,which.max)
+  g.weight1=apply(R.max.trt-potential.outcome,1,sum)
+  g.weight2=R.max.trt-R.min.trt
+  
+  for(i in 1:n){
+    R.secondmax.trt[i]=sort(potential.outcome[i,])[(K-1)] # second large outcome
+    g.weight3[i]=R.max.trt[i]-R.secondmax.trt[i]
+  }
+  #delete the original.order column (and estimated GPS)
+  if(if.matching.GPS){
+    inputdata=inputdata[,-c(seq(K),ncol(inputdata))]
+  } else{
+    inputdata=inputdata[,-ncol(inputdata)]
+  }
+  
+  inputdata=cbind(inputdata,match.set,max.trt=max.trt,R.max.trt=R.max.trt,R.min.trt=R.min.trt,g.weight1=g.weight1,g.weight2=g.weight2,g.weight3=g.weight3)
+  
+  return(inputdata)
+}
+
+
+parAllmethod <- function(ii, decision_boundary = "linear", outcome_model = "simple") {
+  # sink(paste0(ii, ".txt"))
+  performance <- matrix(0, 2, 2)
+  
+  rownames(performance) <- c("value fun", "error rate")
+  colnames(performance) <- c("Match-gw3-cov","Match-gw3-gps")
+  
+  train <- getdata(n = n, p = p, seed = this.seed + ii, decision_boundary = decision_boundary, outcome_model = outcome_model)
+  testing <- test_data(n = n.test, decision_boundary = decision_boundary, outcome_model = outcome_model)
+  
+  colnames(train)[1:p] <- colnames(testing)[1:p] <- paste('X',seq(p),sep='')
+  
+  #only covariate, censor, observed time and treatment
+  inputdata <- train[, -c((dim(train)[2] - 1), dim(train)[2])]
+  
+  # fitting random survival forest
+  rsf_fit <- rfsrc(Surv(R, censor) ~ ., data = inputdata, block.size = 1)
+  
+  #calculate imputation by Cui et al., 2017
+  Q.hat <- condition_survival(S.hat = rsf_fit$survival.oob[which(inputdata$censor == 0), ], Y.grid = rsf_fit$time.interest)
+  impute_all <- rep(NA, nrow(Q.hat))
+  Y <- inputdata[which(inputdata$censor == 0), ]$R 
+  for (i in 1:nrow(Q.hat)) {
+    Y.index <- findInterval(Y[i], rsf_fit$time.interest) + 1
+    Q.Y.hat <- Q.hat[i, Y.index]
+    impute_all[i] <- Q.Y.hat
+  }
+  
+  #imputation by RSF
+  impute_R1 <- expected_survival(S.hat = rsf_fit$survival.oob, Y.grid = rsf_fit$time.interest)
+  
+  if(if.imputeR2){
+    inputdata <- cbind(inputdata, impute = inputdata$R) #imputed by delta*T+(1-delta)*E(tildeT|A,X,tildeT>T,T)
+    inputdata$impute[which(inputdata$censor == 0)] <- impute_all
+  } else {
+    inputdata <- cbind(inputdata, impute = impute_R1) #imputed by E(T|A,X)
+  }
+  
+  #inputdata contains: X1,..,Xp,censor,R(observed outcome),A,impute(for continuous outcome, it is the same as R)
+  
+  ############### Match+ramsvm based methods############
+  ##for calculate valuefun, here originR is the imputation
+  originR <- as.matrix(inputdata$impute)
+  originA <- as.matrix(inputdata$A)
+  
+  ######################## Covariate matching g1############################################
+  #Multiple treatment matching, return inputdata with additional information
+  match.cov.res=MultiMatchGeneral(inputdata = inputdata, if.matching.GPS = FALSE)
+  
+  #train
+  inputX <- as.matrix(inputdata[,1:p]) #use X1,..,Xp to fit the ITR
+  inputY <- as.matrix(match.cov.res$max.trt) #the treatment of maximum potential outcome as the label
+  
+  
+  ######################## Covariate matching gweight3 #######################################
+  #weight by g3()
+  msvm_weight <- as.matrix(match.cov.res$g.weight3)
   
   cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
   ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
@@ -788,434 +1336,76 @@ parAllmethod <- function(ii, decision_boundary = "linear", outcome_model = "simp
   }
   #prediction on test data
   fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-  performance[1, 3] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
-  performance[2, 3] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
-  cat("gaussian gweight2 over!", "\n")
+  performance[1, 1] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
+  performance[2, 1] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
+  cat("gaussian gweight3 over!", "\n")
   
   
-  ###############gaussian owl#####################
-  Lowl <- simu
-  Lowl$A <- c(rep(1, n/K), rep(2, n/K), rep(3, n/K), rep(4, n/K))  
-  train <- list(X = Lowl[, 1:p], A = Lowl$A, R = Lowl$impute)
-
-  inputX <- as.matrix(train$X)
-  inputY <- as.matrix(train$A)
+  ######################## GPS matching g1############################################
+  #Multiple treatment matching, return inputdata with additional information
+  match.gps.res=MultiMatchGeneral(inputdata = inputdata, if.matching.GPS = TRUE)
   
-  #estimated GPS
-  train_df <- data.frame(inputX, inputY, train$R)
-  colnames(train_df)[7:8] <- c("A", "R")  
-  fit <- multinom(A ~ . - R, data = train_df, trace = F)
-  Rx <- fitted(fit)
-  colnames(Rx) <- c("p1", "p2", "p3", "p4")
-  train_df_GPS <- cbind(train_df, Rx)
-  remove(train_df)
+  #train
+  inputX <- as.matrix(inputdata[,1:p]) #use X1,..,Xp to fit the ITR
+  inputY <- as.matrix(match.gps.res$max.trt) #the treatment of maximum potential outcome as the label
   
-  #weight for owl
-  msvm_weight <- rep(0, n)
-
-  msvm_weight[1:(n/K)] <- train_df_GPS$R[1:(n/K)]/train_df_GPS$p1[1:(n/K)]
-  msvm_weight[(n/K + 1):(2 * n/K)] <- train_df_GPS$R[(n/K + 1):(2 * n/K)]/train_df_GPS$p2[(n/K + 1):(2 * n/K)]
-  msvm_weight[(2 * n/K + 1):(3 * n/K)] <- train_df_GPS$R[(2 * n/K + 1):(3 * n/K)]/train_df_GPS$p3[(2 * n/K + 1):(3 * n/K)]
-  msvm_weight[(3 * n/K + 1):n] <- train_df_GPS$R[(3 * n/K + 1):n]/train_df_GPS$p4[(3 * n/K + 1):n]
-  msvm_weight <- as.matrix(msvm_weight)
   
-  cv_param <- cvfun(inputX, inputY, originR = as.matrix(simu$impute), originA = inputY, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
-  ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = msvm_weight), TRUE)
+  ######################## GPS matching gweight3#######################################
+  #weight by g3()
+  msvm_weight <- as.matrix(match.gps.res$g.weight3)
+  
+  cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+  ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
   if (is.character(ramsvm.out)) {
-    return("gaussian owl failed")
+    return("gaussian MSVM gweight3 failed")
   }
   #prediction on test data
   fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-  performance[1, 5] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
-  performance[2, 5] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
-  cat("gaussian owl over!", "\n")
-  sink()
+  performance[1, 2] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$trueR, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE)
+  performance[2, 2] <- error.rate(y = testing$optA, fit.class = fit.class[[paste(cv_param$lambda)]])
+  cat("gaussian gweight3 over!", "\n")
+  
+  # sink()
+  
   return(performance)
 }
 
 
-##############Implementation: correct PS model 1 * survival model 3 * decision_boundary 2 * outcome_model 2 = 12 scenarios#########################
-outcome_setting <- "coxph"
-if (outcome_setting == "coxph") {
-  tau <- tau_coxph
-  theta <- theta_coxph
-} else if (outcome_setting == "coxph2") {
-  tau <- tau_coxph2
-  theta <- theta_coxph2
-} else {
-  tau <- tau_lognormal
-  theta <- theta_lognormal
+for(outcome_setting in outcome_setting_list){
+  if (outcome_setting == "coxph") {
+    tau <- tau_coxph
+    theta <- theta_coxph
+  } else if (outcome_setting == "coxph2") {
+    tau <- tau_coxph2
+    theta <- theta_coxph2
+  } else {
+    tau <- tau_lognormal
+    theta <- theta_lognormal
+  }
+  
+  for(decision_boundary in decision_boundary_list){
+    for(outcome_model in outcome_model_list){
+      
+      sfInit(parallel = TRUE, cpus = 70)
+      sfExportAll()
+      sfLibrary(MASS)
+      sfLibrary(mnormt)
+      sfLibrary(nnet)
+      sfLibrary(e1071)
+      sfLibrary(LaplacesDemon)
+      sfLibrary(Matching)
+      sfLibrary(dplyr)
+      sfLibrary(cluster)
+      sfLibrary(ramsvm)
+      sfLibrary(caret)
+      sfLibrary(survival)
+      sfLibrary(randomForestSRC)
+      sfLibrary(glmnet)
+      # sfLibrary(glmnetUtils)
+      sfLibrary(statmod)
+      pararesult <- sfClusterApplyLB(1:400, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
+      sfStop()
+      save(pararesult, file = paste(outcome_setting, decision_boundary, outcome_model, "g3.Rdata", sep = ""))
+    }
+  }
 }
-
-decision_boundary <- "linear"
-outcome_model <- "simple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "nolinear"
-outcome_model <- "simple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "nolinear"
-outcome_model <- "nosimple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "linear"
-outcome_model <- "nosimple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-
-###########################################################################################################
-outcome_setting <- "coxph2"
-if (outcome_setting == "coxph") {
-  tau <- tau_coxph
-  theta <- theta_coxph
-} else if (outcome_setting == "coxph2") {
-  tau <- tau_coxph2
-  theta <- theta_coxph2
-} else {
-  tau <- tau_lognormal
-  theta <- theta_lognormal
-}
-
-decision_boundary <- "linear"
-outcome_model <- "simple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "nolinear"
-outcome_model <- "simple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "nolinear"
-outcome_model <- "nosimple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "linear"
-outcome_model <- "nosimple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-
-###################################################################################################
-outcome_setting <- "lognormal"
-if (outcome_setting == "coxph") {
-  tau <- tau_coxph
-  theta <- theta_coxph
-} else if (outcome_setting == "coxph2") {
-  tau <- tau_coxph2
-  theta <- theta_coxph2
-} else {
-  tau <- tau_lognormal
-  theta <- theta_lognormal
-}
-
-decision_boundary <- "linear"
-outcome_model <- "simple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "linear"
-outcome_model <- "nosimple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "nolinear"
-outcome_model <- "simple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))
-
-#################################################################################################
-decision_boundary <- "nolinear"
-outcome_model <- "nosimple"
-if (correctPS) {
-  incorPS <- ""
-} else {
-  incorPS <- "incorPS"
-}
-filepath <- paste0("R1modified_", decision_boundary, outcome_model, incorPS, outcome_setting)
-setwd(filepath)
-
-sfInit(parallel = TRUE, cpus = 14)
-sfExportAll()
-sfLibrary(MASS)
-sfLibrary(mnormt)
-sfLibrary(nnet)
-sfLibrary(e1071)
-sfLibrary(LaplacesDemon)
-sfLibrary(Matching)
-sfLibrary(dplyr)
-sfLibrary(cluster)
-sfLibrary(ramsvm)
-sfLibrary(caret)
-sfLibrary(survival)
-sfLibrary(randomForestSRC)
-pararesult <- sfClusterApplyLB(1:200, parAllmethod, decision_boundary = decision_boundary, outcome_model = outcome_model)
-sfStop()
-save(pararesult, file = paste("covariate", decision_boundary, outcome_model, ".Rdata", sep = ""))

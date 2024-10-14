@@ -19,15 +19,7 @@ preprocessing <- function(hcc) {
   return(hcc)
 }
 
-
-#calculate the expected survival time E[T|X,A]
-expected_survival <- function(S.hat, Y.grid) {
-  grid.diff <- diff(c(0, Y.grid, max(Y.grid)))
-  return(c(cbind(1, S.hat) %*% grid.diff))
-}
-
-
-#augmented-owl
+#augmented owl 
 owl.md <- function(X, R, A, testX) {
   
   # Function for Implement the proposed method OWL-MD
@@ -115,216 +107,126 @@ owl.md <- function(X, R, A, testX) {
   return(as.numeric(trt.owlmd))
 }
 
-#Matching based on covariates 
-MultiMatch <- function(reference_group, simu_GPS, calipernum = NULL) {
-  dim_simuGPS <- dim(simu_GPS)[2]
-  if (reference_group == 1) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 1"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 3"
-    trueT1 <- 1
-    trueT2 <- 2
-    trueT3 <- 3
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  } else if (reference_group == 2) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 1"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 3"
-    trueT1 <- 2
-    trueT2 <- 1
-    trueT3 <- 3
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  } else if (reference_group == 3) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 3"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 1"
-    trueT1 <- 3
-    trueT2 <- 2
-    trueT3 <- 1
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  }
+#multiple treatment matching with covariate/GPS for continuous/survival outcome
+MultiMatchGeneral<-function(inputdata,if.matching.GPS=FALSE){
+  #Multiple treatment matching with covariate/GPS for continuous/survival outcome, Mahalanobis distance is used
+  #input inputdata includes: X1,..,Xp,censor,R(observed outcome,but actually not used in this function),
+  #A(must take value in seq(K)),impute(for continuous outcome, it is the same as R). The first p columns inputdata[,1:p] should be X1,..,Xp that used for matching (or estimating GPS if.matching.GPS=TRUE)
+  #output original inputdata with additional information: matched set,weight,the treatment w.r.t. the maximum potential outcome, and the maximum and minimum potential outcomes
+  if(length(unique(inputdata$A))!=K) return("Treatment vector A is not {1,2,..,K}")
   
-  # T1 reference treatment
-  temp12 <- dplyr::filter(simu_GPS, treat != paste("Treatment", trueT3))
-  temp13 <- dplyr::filter(simu_GPS, treat != paste("Treatment", trueT2))
+  n=nrow(inputdata) # sample size
   
-  # matching T1 with the remaining groups
-  match12 <- Match(Y = NULL, Tr = temp12$treat == paste("Treatment", trueT1), X = temp12[, 1:p], caliper = calipernum, ties = FALSE)
-  
-  match13 <- Match(Y = NULL, Tr = temp13$treat == paste("Treatment", trueT1), X = temp13[, 1:p], caliper = calipernum, ties = FALSE)
-  
-  simu_GPS$id <- 1:nrow(simu_GPS)
-  
-  #units in T1 that matched to all the remaining groups
-  simu_GPS$both.1 <- simu_GPS$id %in% match12$index.treated & simu_GPS$id %in% match13$index.treated
-  
-  temp <- simu_GPS[simu_GPS$both.1 == "TRUE", ]
-  m12 <- cbind(match12$index.treated, match12$index.control)
-  m13 <- cbind(match13$index.treated, match13$index.control + sum(simu_GPS$T2 == T))
-  
-  m12 <- m12[m12[, 1] %in% rownames(temp), ]
-  m13 <- m13[m13[, 1] %in% rownames(temp), ]
-  
-  matchset <- cbind(m12[order(m12[, 1]), ], m13[order(m13[, 1]), ])
-  matchset <- as.matrix(matchset[, c(1, 2, 4)])  #Matched set
-  n.trip <- nrow(matchset)
-  
-  ############ Deal the matching result #########
-  #In the same match set, Bi denote argmax Ri, R_Bi denote maxRi, Ci denote argmax Ri, R_Ci denote minRi, g_weight denote g1() in paper 
-  simu_GPS <- cbind(simu_GPS[, 1:dim_simuGPS], B = rep(0, dim(simu_GPS)[1]), R_Bi = rep(0, dim(simu_GPS)[1]), R_Ci = rep(0, dim(simu_GPS)[1]), g_weight = rep(0, dim(simu_GPS)[1]))
-  for (i in 1:n.trip) {
-    index <- matchset[i, ]
-    temp <- data.frame(index = c(index[1], index[2], index[3]), impute = c(simu_GPS$impute[index[1]], simu_GPS$impute[index[2]], simu_GPS$impute[index[3]]), trt = c(trueT1, trueT2, trueT3))
-    maxvalue <- apply(temp, 2, max)[2]
-    minvalue <- apply(temp, 2, min)[2]
-    argmax <- temp[which(temp$impute == maxvalue), 3]
-    argmin <- temp[which(temp$impute == minvalue), 3]
-    if (length(argmax) != 1) {
-      argmax <- min(argmax)
-    }
-    if (length(argmin) != 1) {
-      argmin <- min(argmin)
-    }
-    simu_GPS$B[index[1]] <- argmax
-    simu_GPS$R_Bi[index[1]] <- maxvalue
-    simu_GPS$R_Ci[index[1]] <- minvalue
+  if(if.matching.GPS){
+    logistic.formula=formula(paste("A ~ ", paste("X",seq(p),sep = '',collapse = '+'))) #estimate GPS
+    logistic.fit <- multinom(logistic.formula, data = inputdata, trace = F)
     
-    simu_GPS$g_weight[index[1]] <- abs(maxvalue - temp$impute[1]) + abs(maxvalue - temp$impute[2]) + abs(maxvalue - temp$impute[3])
-    
+    prob.matrix <- fitted(logistic.fit) # each row is (Pr(1|X),..,Pr(K|X))
+    inputdata=cbind(prob.matrix,inputdata,original.order=1:nrow(inputdata)) # the first K column are (Pr(1|X),..,Pr(K|X))
+  } else {
+    inputdata=cbind(inputdata,original.order=1:nrow(inputdata)) # the first K column are (Pr(1|X),..,Pr(K|X))
   }
   
-  Match.result <- simu_GPS[which(simu_GPS$B != 0), ]
   
-  #matched set
-  colnames(matchset) <- c(paste("Treatment", trueT1), paste("Treatment", trueT2), paste("Treatment", trueT3))
-  #adjust the order
-  for (i in 1:K) {
-    matchset[, i] <- simu_GPS$origin_order[matchset[, i]]
+  match.set=matrix(0,nrow = n,ncol=K)
+  
+  colnames(match.set)=1:K
+  
+  for(k in 1:K){
+    # k is the reference group, find the matched set for this group
+    except.k=seq(K)
+    except.k=except.k[except.k!=k] # {1,2,..,(k-1),(k+1),..,K}
+    for(l in except.k){
+      kl.group=inputdata[(inputdata$A==k)|(inputdata$A==l),] # combine k and l groups, for each unit in k, find its matching estimator
+      
+      # matching on GPS/Covariate
+      if(if.matching.GPS){
+        match.kl <- Match(Y = NULL, Tr = kl.group$A==k, X = kl.group[,1:K], ties = FALSE,Weight = 2) # return the matched indexes, but relative to kl.group
+      } else {
+        match.kl <- Match(Y = NULL, Tr = kl.group$A==k, X = kl.group[,1:p], ties = FALSE,Weight = 2) 
+      }
+      
+      match.for.k.treat.l=kl.group$original.order[match.kl[["index.control"]]] # the original order of the matched set
+      k.original.order=kl.group$original.order[match.kl[["index.treated"]]] # original order of k group itself
+      match.set[k.original.order,l]= match.for.k.treat.l
+    }
+    match.set[inputdata$A==k,k]=which(inputdata$A==k) # the matched set for k group relative to k treatment is itself
   }
   
-  return <- list(`reference group` = reference_group, result = Match.result, `match set` = matchset)
+  #treatment w.r.t maximum potential outcome,maximum potential outcome,minimum potential outcome,g1() and g2() weighting function
+  max.trt = R.max.trt=R.min.trt=g.weight1=g.weight2=rep(0,n)
+  potential.outcome=matrix(NA,nrow = n,ncol = K)
+  for(k in 1:K){
+    potential.outcome[,k]=inputdata$impute[match.set[,k]]
+  }
+  R.max.trt=apply(potential.outcome,1,max)
+  R.min.trt=apply(potential.outcome,1,min)
+  max.trt=apply(potential.outcome,1,which.max)
+  g.weight1=apply(R.max.trt-potential.outcome,1,sum)
+  g.weight2=R.max.trt-R.min.trt
+  
+  #delete the original.order column (and estimated GPS)
+  if(if.matching.GPS){
+    inputdata=inputdata[,-c(seq(K),ncol(inputdata))]
+  } else{
+    inputdata=inputdata[,-ncol(inputdata)]
+  }
+  
+  inputdata=cbind(inputdata,match.set,max.trt=max.trt,R.max.trt=R.max.trt,R.min.trt=R.min.trt,g.weight1=g.weight1,g.weight2=g.weight2)
+  
+  return(inputdata)
 }
-
-#Matching based on estimated generalized propensity score
-MultiMatchGps <- function(reference_group, simu_GPS, calipernum = NULL) {
-  dim_simuGPS <- dim(simu_GPS)[2]
-  if (reference_group == 1) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 1"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 3"
-    trueT1 <- 1
-    trueT2 <- 2
-    trueT3 <- 3
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  } else if (reference_group == 2) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 1"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 3"
-    trueT1 <- 2
-    trueT2 <- 1
-    trueT3 <- 3
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  } else if (reference_group == 3) {
-    simu_GPS$T1 <- simu_GPS$treat == "Treatment 3"
-    simu_GPS$T2 <- simu_GPS$treat == "Treatment 2"
-    simu_GPS$T3 <- simu_GPS$treat == "Treatment 1"
-    trueT1 <- 3
-    trueT2 <- 2
-    trueT3 <- 1
-    temp_simu_GPS <- simu_GPS[c(which(simu_GPS$T1 == T), which(simu_GPS$T2 == T), which(simu_GPS$T3 == T)), ]
-    simu_GPS <- temp_simu_GPS
-    rownames(simu_GPS) <- 1:nrow(simu_GPS)
-  }
-  
-  # T1 reference treatment
-  temp12 <- dplyr::filter(simu_GPS, treat != paste("Treatment", trueT3))
-  temp13 <- dplyr::filter(simu_GPS, treat != paste("Treatment", trueT2))
-  
-  # matching T1 with the remaining groups
-  match12 <- Match(Y = NULL, Tr = temp12$treat == paste("Treatment", trueT1), X = temp12[, 1:3], caliper = calipernum, ties = FALSE)
-  
-  match13 <- Match(Y = NULL, Tr = temp13$treat == paste("Treatment", trueT1), X = temp13[, 1:3], caliper = calipernum, ties = FALSE)
-  
-  simu_GPS$id <- 1:nrow(simu_GPS)
-  
-  #units in T1 that matched to all the remaining groups
-  simu_GPS$both.1 <- simu_GPS$id %in% match12$index.treated & simu_GPS$id %in% match13$index.treated
-  
-  temp <- simu_GPS[simu_GPS$both.1 == "TRUE", ]
-  m12 <- cbind(match12$index.treated, match12$index.control)
-  m13 <- cbind(match13$index.treated, match13$index.control + sum(simu_GPS$T2 == T))
-  
-  m12 <- m12[m12[, 1] %in% rownames(temp), ]
-  m13 <- m13[m13[, 1] %in% rownames(temp), ]
-  
-  matchset <- cbind(m12[order(m12[, 1]), ], m13[order(m13[, 1]), ])
-  matchset <- as.matrix(matchset[, c(1, 2, 4)])  #Matched set
-  n.trip <- nrow(matchset)
-  
-  ############ Deal the matching result#########
-  #In the same match set, Bi denote argmax Ri, R_Bi denote maxRi, Ci denote argmax Ri, R_Ci denote minRi, g_weight denote g1() in paper 
-  simu_GPS <- cbind(simu_GPS[, 1:dim_simuGPS], B = rep(0, dim(simu_GPS)[1]), R_Bi = rep(0, dim(simu_GPS)[1]), R_Ci = rep(0, dim(simu_GPS)[1]), g_weight = rep(0, dim(simu_GPS)[1]))
-  for (i in 1:n.trip) {
-    index <- matchset[i, ]
-    temp <- data.frame(index = c(index[1], index[2], index[3]), impute = c(simu_GPS$impute[index[1]], simu_GPS$impute[index[2]], simu_GPS$impute[index[3]]), trt = c(trueT1, trueT2, trueT3))
-    maxvalue <- apply(temp, 2, max)[2]
-    minvalue <- apply(temp, 2, min)[2]
-    argmax <- temp[which(temp$impute == maxvalue), 3]
-    argmin <- temp[which(temp$impute == minvalue), 3]
-    if (length(argmax) != 1) {
-      argmax <- min(argmax)
-    }
-    if (length(argmin) != 1) {
-      argmin <- min(argmin)
-    }
-    simu_GPS$B[index[1]] <- argmax
-    simu_GPS$R_Bi[index[1]] <- maxvalue
-    simu_GPS$R_Ci[index[1]] <- minvalue
-    if (argmax == reference_group) {
-      simu_GPS$R_Zi[index[1]] <- minvalue
-    } else {
-      simu_GPS$R_Zi[index[1]] <- simu_GPS$impute[index[1]]
-    }
-    
-    simu_GPS$g_weight[index[1]] <- abs(maxvalue - temp$impute[1]) + abs(maxvalue - temp$impute[2]) + abs(maxvalue - temp$impute[3])
-    
-  }
-  
-  Match.result <- simu_GPS[which(simu_GPS$B != 0), ]
-  
-  colnames(matchset) <- c(paste("Treatment", trueT1), paste("Treatment", trueT2), paste("Treatment", trueT3))
-  #matched set 
-  for (i in 1:K) {
-    matchset[, i] <- simu_GPS$origin_order[matchset[, i]]
-  }
-  
-  return <- list(`reference group` = reference_group, result = Match.result, `match set` = matchset)
-}
-
 
 #misclassification rate
 error.rate <- function(y, fit.class) return(sum(fit.class != y)/length(fit.class))
 
-#cross validation for tuning penalty parameter lambda
+valuefun <- function(X, R, A, est_ITR, if_test = FALSE, testing_id = 1) {
+  # little different from that in simulation code. Here we add testing_id to calculate the cross valided value
+  # Input: covariate, treatment, outcome(if_test=FALSE,then R is (pseudo) outcome; if_test=TRUE, then R is true outcome(survival time)), estimated ITR
+  # Output: value function
+  # When if_test=FLASE, this function is used in tuning parameters in CV, it estimates the propensity score by multinomial logistics. Use estimated PS and (pseudo) outcome
+  # When if_test=TRUE, calculate the testing performance. Use the true propensity score and true outcome (if survival data, use true survival time)
+  # value function = sum(I[Ai=D(Xi)]Ri/p(Ai,Xi)) / sum(I[Ai=D(Xi)] /p(Ai,Xi))
+  # Since in real data we don't know the true survival time, we use the empirical pseudo value function by imputation
+  id <- which(est_ITR == A)
+  
+  if (if_test == FALSE) {
+    # estimate PS
+    X <- data.frame(X)
+    colnames(X) <- paste("X",seq(p),sep = '')
+    
+    logistic.formula=formula(paste("A ~ ", paste("X",seq(p),sep = '',collapse = '+')))
+    logistic.fit <- multinom(logistic.formula, data = cbind(A, X), trace = F)
+    prob.matrix <- fitted(logistic.fit) # each row is (Pr(1|X),..,Pr(K|X))
+    prob.A=rep(0, nrow(X)) # vector of Pr(A|X)
+    for(k in 1:K){
+      prob.A[A==k]=prob.matrix[A==k,k]
+    }
+    
+    denominator <- numerator <- 0
+    for (i in id) denominator <- denominator + 1/prob.A[i]
+    for (i in id) numerator <- numerator + R[i]/prob.A[i]
+    
+  } else {
+    all_sample_PS <- all_sample_PS[testing_id, ]
+    
+    denominator <- sum(sapply(id, function(i) 1/all_sample_PS[i,A[i]]))
+    numerator <- sum(sapply(id, function(i) R[i]/all_sample_PS[i,A[i]]))
+  }
+  return(numerator/denominator)
+}
+
+#cross validation for tuning penalty parameter lambda. This function is used for RAMSVM based methods
 cvfun <- function(inputX, inputY, originR, originA, fold = 3, lambda, kernel = "linear", kparam = 1, weight = NA) {
   #X covariate, Y label for MSVM, A original treatment, R: outcome
   set.seed(2021)
-  if (kernel == "linear") {
+  if (kernel == "linear")
+  {
     kparam <- 1
-  }
+  } 
   
   folds <- createFolds(inputY, k = fold)
-  ValueFun <- matrix(0, ncol = length(kparam), nrow = length(lambda))
+  ValueFun <- matrix(0, ncol = length(kparam), nrow = length(lambda))  
   for (i in 1:fold) {
     cat("Leaving subset[", i, "] out in", fold, "fold CV:", "\n")
     fold_testx <- inputX[folds[[i]], ]  #folds[[i]] for validation
@@ -335,17 +237,16 @@ cvfun <- function(inputX, inputY, originR, originA, fold = 3, lambda, kernel = "
     # A and R used for valuefun
     fold_testR <- originR[folds[[i]], ]
     fold_testA <- originA[folds[[i]], ]
-    fold_testing <- data.frame(cbind(A = fold_testA, R = fold_testR, fold_testx))
     
     fold_weight <- if (sum(is.na(weight)) != 0) {
       NA
     } else {
       weight[-folds[[i]], ]
-    }
+    }  
     
-    row.index <- 0
+    row.index <- 0  
     for (j in lambda) {
-      col.index <- 0
+      col.index <- 0  
       row.index <- row.index + 1
       for (k in kparam) {
         col.index <- col.index + 1
@@ -356,6 +257,7 @@ cvfun <- function(inputX, inputY, originR, originA, fold = 3, lambda, kernel = "
             next
           }
           fit.class <- predict(ramsvm.out, fold_testx)
+          
           j <- paste(j)
           fit.class <- fit.class[[j]]
         } else {
@@ -365,56 +267,264 @@ cvfun <- function(inputX, inputY, originR, originA, fold = 3, lambda, kernel = "
             next
           }
           fit.class <- predict(ramsvm.out, fold_testx)
+          
           j <- paste(j)
           fit.class <- fit.class[[j]]
         }
-        ValueFun[row.index, col.index] <- ValueFun[row.index, col.index] + valuefun(fold_testing, est_ITR = fit.class)/fold
+        ValueFun[row.index, col.index] <- ValueFun[row.index, col.index] + valuefun(X = fold_testx, R = fold_testR, A = fold_testA, est_ITR = fit.class)/fold
       }
       cat("*")
     }
     cat("\n")
   }
-  optIndex <- which(ValueFun == max(ValueFun), arr.ind = TRUE)[1, ]
+  optIndex <- which(ValueFun == max(ValueFun), arr.ind = TRUE)[1, ]  
   return(list(lambda = lambda[optIndex[1]], kparam = kparam[optIndex[2]], value = ValueFun))
 }
 
-g <- function(x, y) {
-  return(x - y)
-}
-
-propensity <- function(testing, A) {
-  PS <- switch(as.numeric(A), testing$p1, testing$p2, testing$p3)
-  return(PS)
-}
-
-#calculate value function
-valuefun <- function(testing, est_ITR, if_test = FALSE, testing_id = 1) {
-  # Input: covariate, treatment, outcome, estimated ITR
-  # Output: value function
-  # When if_test=FLASE, estimate the propensity score by multinomial logistics
-  # When calculate the testing performance, set if_test=TRUE and use the estimated generalized propensity score by all sample
-  # value function = sum(I[Ai=D(Xi)]Ri/p(Ai,Xi)) / sum(I[Ai=D(Xi)] /p(Ai,Xi))
-  # Since in real data we don't know the true survival time, we use the empirical pseudo value function that replace censored observations by imputation
-  id <- which(est_ITR == testing$A)
-  if (if_test == FALSE) {
-    logit_formula <- paste("A  ~", paste(covariate_name, collapse = "+"))
-    
-    fit <- multinom(logit_formula, data = testing, trace = F)
-    Rx <- fitted(fit)
-    colnames(Rx) <- c("p1", "p2", "p3")
-    test_PS <- cbind(testing, Rx)
-    
-    denominator <- numerator <- 0
-    for (i in id) denominator <- denominator + 1/propensity(test_PS[i, ], test_PS$A[i])
-    for (i in id) numerator <- numerator + test_PS$R[i]/propensity(test_PS[i, ], test_PS$A[i])
-  } else {
-    R1 <- testing$R
-    all_sample_PS <- all_sample_PS[testing_id, ]
-    denominator <- numerator <- 0
-    for (i in id) denominator <- denominator + 1/propensity(all_sample_PS[i, ], all_sample_PS$treat[i])
-    for (i in id) numerator <- numerator + R1[i]/propensity(all_sample_PS[i, ], all_sample_PS$treat[i])
+#imputation by Cui et al., 2017, Electronic journal of statistics
+condition_survival <- function(S.hat, Y.grid) {
+  Y.diff <- diff(c(0, Y.grid))
+  Q.hat <- matrix(NA, nrow(S.hat), ncol(S.hat))
+  dot.products <- sweep(S.hat[, 1:(ncol(S.hat) - 1)], 2, Y.diff[2:ncol(S.hat)], "*")
+  Q.hat[, 1] <- rowSums(dot.products)
+  for (i in 2:(ncol(Q.hat) - 1)) {
+    Q.hat[, i] <- Q.hat[, i - 1] - dot.products[, i - 1]
   }
-  return(numerator/denominator)
+  Q.hat <- Q.hat/S.hat
+  Q.hat <- sweep(Q.hat, 2, Y.grid, "+") 
+  Q.hat[, ncol(Q.hat)] <- tau
+  
+  #calculate the integral from the last event time to tau and add it to Q.hat 
+  for(i in 1:nrow(Q.hat)){
+    last_rectangle=(tau-Y.grid[ncol(Q.hat)])*S.hat[i,ncol(Q.hat)]
+    for(j in 1:(ncol(Q.hat)-1)){
+      Q.hat[i,j]=Q.hat[i,j]+last_rectangle/S.hat[i,j]
+    }
+  }
+  
+  Q.hat0 <- matrix(expected_survival(S.hat, Y.grid), nrow(S.hat), 1)
+  Q.hat <- cbind(Q.hat0, Q.hat)
+  return(Q.hat)
+}
+
+#imputation E[T|A,X]
+expected_survival <- function(S.hat, Y.grid) {
+  grid.diff <- diff(c(0, Y.grid, tau))
+  return(c(cbind(1, S.hat) %*% grid.diff))
+}
+
+########################### Functions for AD-learning Qi et al. 2020 ##########################
+encode<-function(A,K){
+  # input one unit's integer treatment A in {1,2,..,K}
+  # output one of the K simplex vertices defined in R^{k-1}
+  if(A==1){
+    return((K-1)^{-1/2}*rep(1,K-1))
+  }else{
+    e_Aminus1=rep(0,K-1)
+    e_Aminus1[A-1]=1
+    return(-(1+sqrt(K))*(K-1)^{-3/2}*rep(1,K-1)+(K/(K-1))^{1/2}*e_Aminus1)
+  }
+}
+
+# accelerated proximal gradient optimization from https://github.com/jpvert/apg
+apg <- function(grad_f, prox_h, dim_x, opts) {
+  
+  # Set default parameters
+  X_INIT <- numeric(dim_x) # initial starting point
+  USE_RESTART <- TRUE # use adaptive restart scheme
+  MAX_ITERS <- 2000 # maximum iterations before termination
+  EPS <- 1e-6 # tolerance for termination
+  ALPHA <- 1.01 # step-size growth factor
+  BETA <- 0.5 # step-size shrinkage factor
+  QUIET <- FALSE # if false writes out information every 100 iters
+  GEN_PLOTS <- TRUE # if true generates plots of norm of proximal gradient
+  USE_GRA <- FALSE # if true uses UN-accelerated proximal gradient descent (typically slower)
+  STEP_SIZE = NULL # starting step-size estimate, if not set then apg makes initial guess
+  FIXED_STEP_SIZE <- FALSE # don't change step-size (forward or back tracking), uses initial step-size throughout, only useful if good STEP_SIZE set
+  
+  # Replace the default parameters by the ones provided in opts if any
+  for (u in c("X_INIT","USE_RESTART", "MAX_ITERS", "EPS", "ALPHA", "BETA", "QUIET", "GEN_PLOTS", "USE_GRA", "STEP_SIZE", "FIXED_STEP_SIZE")) {
+    eval(parse(text=paste('if (exists("',u,'", where=opts)) ',u,' <- opts[["',u,'"]]',sep='')))
+  }
+  
+  # Initialization
+  x <- X_INIT
+  y <- x
+  g <- grad_f(y, opts)
+  if (norm_vec(g) < EPS) {
+    return(list(x=x,t=0))
+  }
+  theta <- 1
+  
+  # Initial step size
+  if (is.null(STEP_SIZE)) {
+    
+    # Barzilai-Borwein step-size initialization:
+    t <- 1 / norm_vec(g)
+    x_hat <- x - t*g
+    g_hat <- grad_f(x_hat, opts)
+    t <- abs(sum( (x - x_hat)*(g - g_hat)) / (sum((g - g_hat)^2)))
+  } else {
+    t <- STEP_SIZE
+  }
+  
+  # Main loop
+  for (k in seq(MAX_ITERS)) {
+    
+    if (!QUIET && (k %% 100==0)) {
+      message(paste('iter num ',k,', norm(tGk): ',err1,', step-size: ',t,sep=""))
+    }
+    
+    x_old <- x
+    y_old <- y
+    
+    # The proximal gradient step (update x)
+    x <- prox_h( y - t*g, t, opts)
+    
+    # The error for the stopping criterion
+    err1 <- norm_vec(y-x) / max(1,norm_vec(x))
+    if (err1 < EPS) break
+    
+    # Update theta for acceleration
+    if(!USE_GRA)
+      theta <- 2/(1 + sqrt(1+4/(theta^2)))
+    else
+      theta <- 1
+    end
+    
+    # Update y
+    if (USE_RESTART && sum((y-x)*(x-x_old))>0) {
+      x <- x_old
+      y <- x
+      theta <- 1
+    } else {
+      y <- x + (1-theta)*(x-x_old)
+    }
+    
+    # New gradient
+    g_old <- g
+    g <- grad_f(y,opts)
+    
+    # Update stepsize by TFOCS-style backtracking
+    if (!FIXED_STEP_SIZE) {
+      t_hat <- 0.5*sum((y-y_old)^2)/abs(sum((y - y_old)*(g_old - g)))
+      t <- min( ALPHA*t, max( BETA*t, t_hat ))
+    }
+  }
+  if (!QUIET) {
+    message(paste('iter num ',k,', norm(tGk): ',err1,', step-size: ',t,sep=""))
+    if (k==MAX_ITERS) message(paste('Warning: maximum number of iterations reached'))
+    message('Terminated')
+  }
+  
+  # Return solution and step size
+  return(list(x=x,t=t))
+}
+
+# proximal operator of group lasso, if no "groups" in opts, then return to L1 lasso
+prox.grouplasso <- function(x, t, opts=list(groups=as.list(seq(length(x))))) {
+  
+  if (!exists("groups",where=opts))
+    stop("No list of groups provided for the group lasso.")
+  ngroups <- length(opts$groups)
+  if (!exists("groupweights",where=opts)) {
+    w <- rep(t, ngroups)
+  } else {
+    if (length(opts[["groupweights"]]) == ngroups) {
+      w <- t*opts[["groupweights"]]
+    } else {
+      w <- t*rep(opts[["groupweights"]][1], ngroups)
+    }
+  }
+  
+  u <- x
+  for (i in seq(ngroups)) {
+    g <- opts[["groups"]][[i]]
+    u[g] <- max(0, 1 - w[i] / norm_vec(x[g]) ) * x[g]
+  }
+  return(u)
+}
+
+norm_vec <- function(x) {
+  sqrt(sum(x^2))
+}
+
+# gradient of negative log partial likelihood of weighted Cox regression in Qi et al.(2020)
+grad.cox<-function(Beta,opts){
+  #parameter to optimize is the Beta vector,opts must contain time, event, prob_A(i.e.,Pr(Ai|Xi)) and X(n*p design matrix)
+  observe_time=opts[['time']]
+  delta=opts[['event']]
+  inverse_prob_A=1/opts[['prob_A']]
+  inverse_prob_A=inverse_prob_A/sum(inverse_prob_A) #normalize the weights to 1 as glmnet. If unweighted, then it is 1/n for each unit.
+  X=opts[['X']]
+  n=length(observe_time) #total sample size
+  
+  score_Beta=0
+  
+  for(i in 1:n){
+    if(delta[i]==1){
+      score_Beta1=-X[i,]
+      
+      ind_Risk=as.numeric(observe_time>=observe_time[i]) # indicator for risk set, i.e., the risk set at this time
+      denominator=sum(exp(X%*%Beta)*ind_Risk)
+      w_ji=exp(X%*%Beta)/denominator # w_ji=exp(x_j*beta)/sum_{l:Y_l>=Y_i} exp(x_l*beta), but this is actually n-dimensional vector
+      
+      w_ji_X=vecmat(as.vector(w_ji),X) # vecmat is equivalent to diag(as.vector(w_ji))%*%X, but extremely faster
+      score_Beta2=apply(vecmat(ind_Risk,w_ji_X),2,sum) #sum_{j:Y_j>=Y_i} w_ji*x_j
+      
+      score_Beta=score_Beta+inverse_prob_A[i]*(score_Beta1+score_Beta2) 
+    }
+  }
+  return(score_Beta)
+}
+
+# AD-learning for survival data
+ADlearning.surv<-function(time,event,A,X,prob_A,groups=split(1:(p*(K-1)),1:p),lambda){
+  # time,event,A,prob_A are n*1 vectors, where A is treatment,X is design matrix, prob_A is Pr(A|X). 
+  # groups is a list of indexes. it is corresponding to modified.covariate
+  # return the coefficient matrix
+  if(length(unique(A))!=K) return("Treatment vector A is not {1,2,..,K}")
+  n=length(time) #n is the sample size of input data
+  p=ncol(X)
+  
+  modified.covariate=matrix(NA,nrow = n,ncol=p*(K-1)) # modified.covariate is the matrix of xw^T after vectorized, resulting in n*(p*(K-1)) matrix.
+  for(i in 1:n){
+    modified.matrix=matrix(X[i,],ncol = 1)%*%matrix(encode(A[i],K),nrow=1) #xw^T,p*(K-1) matrix
+    modified.covariate[i,]=matrix(modified.matrix,nrow = 1) #vectorized by column order, i.e., the first p covariates denote the first column of xw^T
+  }
+  
+  #coefficient matrix B (p*(K-1)), but it is vectorized by column order. The first p coefficients denote the first column of B
+  Bhat=apg(grad.cox,prox.grouplasso,dim_x = dim(modified.covariate)[2],opts = list(time=time,event=event,X=modified.covariate,prob_A=prob_A,
+                                                                                   groups=groups,groupweights=lambda,QUIET=TRUE))$x
+  Bhat=matrix(Bhat,nrow = p)
+  return(Bhat)
+}
+
+cv.ADlearning.surv <- function(inputdata,prob.A,w.k.matrix,lambda,fold=3) {
+  # lambda should be a vector. Find the optimal lambda that maximize the empirical value function
+  set.seed(2021)
+  folds <- createFolds(prob.A, k = fold)
+  ValueFun <- rep(0,length(lambda)) 
+  
+  for (i in 1:fold) {
+    cat("Leaving subset[", i, "] out in", fold, "fold CV:", "\n")
+    inputdata_in=inputdata[-folds[[i]],]
+    inputdata_out=inputdata[folds[[i]],]
+    prob.A_in=prob.A[-folds[[i]]]
+    
+    for (j in 1:length(lambda)) {
+      Bhat=ADlearning.surv(time = inputdata_in$R,event = inputdata_in$censor,A = inputdata_in$A,X = as.matrix(inputdata_in[,1:p]),prob_A = prob.A_in,lambda = lambda[j])
+      # optimal ITR is argmin w_k^T*B^T*x. The matrix XBW is n*K, the ij element is x_i^T*B*w_j
+      AD.pred.matrix=as.matrix(inputdata_out[,1:p])%*%Bhat%*%w.k.matrix
+      fit.class=apply(AD.pred.matrix,MARGIN = 1,which.min)
+      ValueFun[j] <- ValueFun[j] + valuefun(X = as.matrix(inputdata_out[,1:p]), R = inputdata_out$impute, A = inputdata_out$A, est_ITR = fit.class)/fold
+      cat("*")
+    }
+    cat("\n")
+  }
+  
+  optIndex <- which.max(ValueFun) 
+  return(list(lambda = lambda[optIndex], value = ValueFun))
 }
 
 
@@ -424,12 +534,12 @@ valuefun <- function(testing, est_ITR, if_test = FALSE, testing_id = 1) {
 paraPredict <- function(ii) {
   set.seed(ii)
   
-  result <- matrix(0, fold, 10)
-  colnames(result) <- c("g1-cov", "gweight1-cov", "gweight2-cov", "g1-gps", "gweight1-gps", "gweight2-gps", "aug-owl", "owl", "cox", "weight-cox")
+  result <- matrix(0, fold, 11)
+  colnames(result) <- c("Match-g1-cov","Match-g1-gps","Match-gw1-cov","Match-gw1-gps","Match-gw2-cov","Match-gw2-gps","Multi-AOL", "Multi-OL", "Cox","Q-learning",'AD-learning')
   
-  performance <- matrix(0, 1, 10)
+  performance <- matrix(0, 1, 11)
   rownames(performance) <- "value fun"
-  colnames(performance) <- c("g1-cov", "gweight1-cov", "gweight2-cov", "g1-gps", "gweight1-gps", "gweight2-gps", "aug-owl", "owl", "cox", "weight-cox")
+  colnames(performance) <- c("Match-g1-cov","Match-g1-gps","Match-gw1-cov","Match-gw1-gps","Match-gw2-cov","Match-gw2-gps","Multi-AOL", "Multi-OL", "Cox","Q-learning",'AD-learning')
   
   folds <- createFolds(hss_impute$impute, k = fold)
   
@@ -437,269 +547,245 @@ paraPredict <- function(ii) {
     cat("Overall Leaving subset[", f, "] out in", fold, "fold CV:", "\n")
     
     ####### partition training and testing ########
-    train <- hss_impute[-folds[[f]], ]
+    inputdata <- hss_impute[-folds[[f]], ] # for convenience, inputdata is training data.
     testing <- hss_impute[folds[[f]], ]
-    n_train <- nrow(train)
-    
-    testing <- cbind(testing[, 1:p], testing$treat, testing$censor, testing$impute)
-    colnames(testing)[(p + 1):length(testing)] <- c("A", "censor", "R")
-    
-    ###############Standard Cox model#####################
-    Coxtrain <- cbind(train[, 1:p], train$treat, train$censor, train$truncateR)
-    colnames(Coxtrain)[(p + 1):length(Coxtrain)] <- c("A", "censor", "R")
-    
-    Coxtrain$A <- factor(Coxtrain$A)
-    testing$A <- factor(testing$A)
-    
-    #Cox regression with (X,A,AX)
-    cox_formula <- formula(paste("Surv(R,censor) ~ A +", paste(covariate_name, collapse = "+"), "+", paste(covariate_name, rep("*A", length(covariate_name)), sep = "", collapse = "+")))
-    cox_model <- coxph(cox_formula, data = Coxtrain, method = "breslow", eps = 1e-07, iter.max = 20)
-    
-    testA1 <- data.frame(testing[, 1:p], A = factor(rep(1, nrow(testing))))
-    testA2 <- data.frame(testing[, 1:p], A = factor(rep(2, nrow(testing))))
-    testA3 <- data.frame(testing[, 1:p], A = factor(rep(3, nrow(testing))))
-    
-    cox_result <- matrix(rep(0, nrow(testing) * 3), ncol = 3)
-    dimnames(cox_result) <- list(1:nrow(testing), 1:3)
-    cox_result[, 1] <- predict(cox_model, testA1, type = "risk")
-    cox_result[, 2] <- predict(cox_model, testA2, type = "risk")
-    cox_result[, 3] <- predict(cox_model, testA3, type = "risk")
-    
-    predict_ITR <- as.numeric(apply(cox_result, 1, function(t) colnames(cox_result)[which.min(t)]))
-    
-    performance[1, 9] <- valuefun(testing, est_ITR = predict_ITR, if_test = TRUE, testing_id = folds[[f]])
-    testing$cox <- predict_ITR
-    
-    cat("standard cox over!", "\n")
-    
-    ###############Weighted Cox model#####################
-    #not displayed in the paper
-    fit <- multinom(A ~ . - R - censor, data = Coxtrain, trace = F)
-    Rx <- fitted(fit)
-    colnames(Rx) <- c("p1", "p2", "p3")
-    Coxtrain_GPS <- cbind(Coxtrain, Rx)
-    
-    for (i in 1:nrow(Coxtrain_GPS)) {
-      if (Coxtrain_GPS[i, ]$A == "1")
-        Coxtrain_GPS$weight[i] <- Coxtrain_GPS$p1[i]
-      if (Coxtrain_GPS[i, ]$A == "2")
-        Coxtrain_GPS$weight[i] <- Coxtrain_GPS$p2[i]
-      if (Coxtrain_GPS[i, ]$A == "3")
-        Coxtrain_GPS$weight[i] <- Coxtrain_GPS$p3[i]
-    }
-    
-    cox_formula <- formula(paste("Surv(R,censor) ~ A +", paste(covariate_name, collapse = "+"), "+", paste(covariate_name, rep("*A", length(covariate_name)), sep = "", collapse = "+")))
-    cox_GPS_model <- coxph(cox_formula, data = Coxtrain_GPS, weights = weight)
-    
-    cox_result <- matrix(rep(0, nrow(testing) * 3), ncol = 3)
-    dimnames(cox_result) <- list(1:nrow(testing), 1:3)
-    cox_result[, 1] <- predict(cox_GPS_model, testA1, type = "risk")
-    cox_result[, 2] <- predict(cox_GPS_model, testA2, type = "risk")
-    cox_result[, 3] <- predict(cox_GPS_model, testA3, type = "risk")
-    
-    predict_ITR <- as.numeric(apply(cox_result, 1, function(t) colnames(cox_result)[which.min(t)]))
-    
-    performance[1, 10] <- valuefun(testing, est_ITR = predict_ITR, if_test = TRUE, testing_id = folds[[f]])
-    testing$weight_cox <- predict_ITR
-    cat("weighted cox owl over!", "\n")
-    
-    ############## augmented owl ################
-    Owltrain <- cbind(train[, 1:p], train$treat, train$censor, train$impute)
-    colnames(Owltrain)[(p + 1):length(Owltrain)] <- c("A", "censor", "R")
-    
-    trt.owlmd <- owl.md(X = as.matrix(Owltrain[, 1:p]), R = Owltrain$R, A = Owltrain$A, testX = as.matrix(testing[, 1:p]))
-    performance[1, 7] <- valuefun(testing, est_ITR = trt.owlmd, if_test = TRUE, testing_id = folds[[f]])
-    testing$aug_owl <- trt.owlmd
-    
-    cat("augmented owl over!", "\n")
+    n.train <- nrow(inputdata)
+    n.test <- nrow(testing)
     
     
-    ################## Match+ramsvm based methods#################
+    ############### Match+ramsvm based methods############
+    ##for calculate valuefun, here originR is the imputation
+    originR <- as.matrix(inputdata$impute)
+    originA <- as.matrix(inputdata$A)
     
-    ################## CovMatch #############################
-    train_GPS <- cbind(train, origin_order = 1:nrow(train))
+    ######################## Covariate matching g1############################################
+    #Multiple treatment matching, return inputdata with additional information
+    match.cov.res=MultiMatchGeneral(inputdata = inputdata, if.matching.GPS = FALSE)
     
-    train_GPS[which(train_GPS$treat == 1), ]$treat <- "Treatment 1"
-    train_GPS[which(train_GPS$treat == 2), ]$treat <- "Treatment 2"
-    train_GPS[which(train_GPS$treat == 3), ]$treat <- "Treatment 3"
-    
-    #Matching based on covariates
-    MultiMtrt1 <- MultiMatch(1, train_GPS, calipernum)
-    MultiMtrt2 <- MultiMatch(2, train_GPS, calipernum)
-    MultiMtrt3 <- MultiMatch(3, train_GPS, calipernum)
-    cat("Match over!", "\n")
-    
-    #for calculate valuefun
-    originR <- rbind(as.matrix(train$impute[MultiMtrt1$`match set`[, 1]]), as.matrix(train$impute[MultiMtrt2$`match set`[, 1]]), as.matrix(train$impute[MultiMtrt3$`match set`[, 1]]))
-    
-    originA <- as.matrix(rep(c(1, 2, 3), c(length(MultiMtrt1$result$impute), length(MultiMtrt2$result$impute), length(MultiMtrt3$result$impute))))
-    
-    #########################gaussian g1##########################################
-    inputX <- rbind(MultiMtrt1$result[, 1:p], MultiMtrt2$result[, 1:p], MultiMtrt3$result[, 1:p])
-    inputX <- as.matrix(inputX)
-    inputY <- rbind(as.matrix(MultiMtrt1$result$B), as.matrix(MultiMtrt2$result$B), as.matrix(MultiMtrt3$result$B))
+    #train
+    inputX <- as.matrix(inputdata[,1:p]) #use X1,..,Xp to fit the ITR
+    inputY <- as.matrix(match.cov.res$max.trt) #the treatment of maximum potential outcome as the label
     
     cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian")
     ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian"), TRUE)
     if (is.character(ramsvm.out)) {
-      return("gaussian g1 failed")
+      return("gaussian MSVM g1 failed")
     }
-    
     #prediction on test data
     fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-    
-    performance[1, 1] <- valuefun(testing, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
-    testing$g1_cov <- fit.class[[paste(cv_param$lambda)]]
-    
+    performance[1, 1] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$impute, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
     cat("gaussian g1 over!", "\n")
     
     
-    #########################gaussian gweight2##########################################
-    #weight
-    msvm_weight <- as.matrix(c(g(MultiMtrt1$result$R_Bi, MultiMtrt1$result$R_Ci), g(MultiMtrt2$result$R_Bi, MultiMtrt2$result$R_Ci), g(MultiMtrt3$result$R_Bi, MultiMtrt3$result$R_Ci)))
+    ######################### Covariate matching gweight1#####################################
+    #weight by g1()
+    msvm_weight <- as.matrix(match.cov.res$g.weight1)
     
     cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
     ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
     if (is.character(ramsvm.out)) {
-      return("gaussian gweight2 failed")
+      return("gaussian MSVM gweight1 failed")
     }
     #prediction on test data
     fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-    
-    performance[1, 3] <- valuefun(testing, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
-    testing$gx_v2_cov <- fit.class[[paste(cv_param$lambda)]]
-    
-    cat("gaussian gweight2 over!", "\n")
-    
-    ##########################gaussian gweight1##########################################
-    #train
-    msvm_weight <- as.matrix(c(MultiMtrt1$result$g_weight, MultiMtrt2$result$g_weight, MultiMtrt3$result$g_weight))
-    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
-    ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
-    if (is.character(ramsvm.out)) {
-      return("gaussian gweight1 failed")
-    }
-    #prediction on test data
-    fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-    
-    performance[1, 2] <- valuefun(testing, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
-    testing$gweight_cov <- fit.class[[paste(cv_param$lambda)]]
-    
-    cat("gaussian gweight1!", "\n")
-    
-    
-    ########################GpsMatch################################################
-    
-    p_MatchGps <- dim(hss_impute)[2]
-    
-    #Estimated generalize propensity scores for matching in training data, but still using covariates for fitting ITR
-    #train_MatchGps includes gps1 gps2 gps3 treatment censor truncateR imputeR
-    train_MatchGps <- all_sample_PS[-folds[[f]], c(p_MatchGps + 1, p_MatchGps + 2, p_MatchGps + 3, p_MatchGps - 3, p_MatchGps - 2, p_MatchGps - 1, p_MatchGps)]
-    train_GPS <- cbind(train_MatchGps, origin_order = 1:nrow(train_MatchGps))
-    
-    train_GPS[which(train_GPS$treat == 1), ]$treat <- "Treatment 1"
-    train_GPS[which(train_GPS$treat == 2), ]$treat <- "Treatment 2"
-    train_GPS[which(train_GPS$treat == 3), ]$treat <- "Treatment 3"
-    
-    #Matching based on gps
-    MultiMtrt1 <- MultiMatchGps(1, train_GPS, calipernum)
-    MultiMtrt2 <- MultiMatchGps(2, train_GPS, calipernum)
-    MultiMtrt3 <- MultiMatchGps(3, train_GPS, calipernum)
-    cat("Match over!", "\n")
-    
-    
-    originR <- rbind(as.matrix(train$impute[MultiMtrt1$`match set`[, 1]]), as.matrix(train$impute[MultiMtrt2$`match set`[, 1]]), as.matrix(train$impute[MultiMtrt3$`match set`[, 1]]))
-    
-    originA <- as.matrix(rep(c(1, 2, 3), c(length(MultiMtrt1$result$impute), length(MultiMtrt2$result$impute), length(MultiMtrt3$result$impute))))
-    
-    #########################gaussian g1##########################################
-    #train 
-    inputX <- rbind(train[MultiMtrt1$`match set`[, 1], 1:p], train[MultiMtrt2$`match set`[, 1], 1:p], train[MultiMtrt3$`match set`[, 1], 1:p])
-    inputX <- as.matrix(inputX)
-    inputY <- rbind(as.matrix(MultiMtrt1$result$B), as.matrix(MultiMtrt2$result$B), as.matrix(MultiMtrt3$result$B))
-    
-    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian")
-    ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian"), TRUE)
-    if (is.character(ramsvm.out)) {
-      return("gaussian g1 failed")
-    }
-    
-    #prediction on test data
-    fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-    
-    performance[1, 4] <- valuefun(testing, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
-    testing$g1_gps <- fit.class[[paste(cv_param$lambda)]]
-    
-    cat("gaussian g1 over!", "\n")
-    
-    
-    #########################gaussian gweight2##########################################
-    #train
-    msvm_weight <- as.matrix(c(g(MultiMtrt1$result$R_Bi, MultiMtrt1$result$R_Ci), g(MultiMtrt2$result$R_Bi, MultiMtrt2$result$R_Ci), g(MultiMtrt3$result$R_Bi, MultiMtrt3$result$R_Ci)))
-    
-    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
-    ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
-    if (is.character(ramsvm.out)) {
-      return("gaussian gweight2 failed")
-    }
-    #prediction on test data
-    fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-    
-    performance[1, 6] <- valuefun(testing, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
-    testing$gx_v2_gps <- fit.class[[paste(cv_param$lambda)]]
-    
-    cat("gaussian gweight2 over!", "\n")
-    
-    ##########################gaussian gweight1##########################################
-    #train
-    msvm_weight <- as.matrix(c(MultiMtrt1$result$g_weight, MultiMtrt2$result$g_weight, MultiMtrt3$result$g_weight))
-    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
-    ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
-    if (is.character(ramsvm.out)) {
-      return("gaussian gweight1 failed")
-    }
-    #prediction on test data
-    fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-    
-    performance[1, 5] <- valuefun(testing, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
-    testing$gweight_gps <- fit.class[[paste(cv_param$lambda)]]
-    
+    performance[1, 3] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$impute, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
     cat("gaussian gweight1 over!", "\n")
     
     
-    ###############gaussian owl########################
+    ######################## Covariate matching gweight2#######################################
+    #weight by g2()
+    msvm_weight <- as.matrix(match.cov.res$g.weight2)
+    
+    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+    ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
+    if (is.character(ramsvm.out)) {
+      return("gaussian MSVM gweight2 failed")
+    }
+    #prediction on test data
+    fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+    performance[1, 5] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$impute, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
+    cat("gaussian gweight2 over!", "\n")
+    
+    
+    ######################## GPS matching g1############################################
+    #Multiple treatment matching, return inputdata with additional information
+    match.gps.res=MultiMatchGeneral(inputdata = inputdata, if.matching.GPS = TRUE)
+    
     #train
-    inputX <- as.matrix(train[, 1:p])
-    inputY <- as.matrix(train$treat)
+    inputX <- as.matrix(inputdata[,1:p]) #use X1,..,Xp to fit the ITR
+    inputY <- as.matrix(match.gps.res$max.trt) #the treatment of maximum potential outcome as the label
     
-    train_df <- data.frame(inputX, A = inputY, R = train$impute)
-    fit <- multinom(A ~ . - R, data = train_df, trace = F)
-    Rx <- fitted(fit)
-    colnames(Rx) <- c("p1", "p2", "p3")
-    train_df_GPS <- cbind(train_df, Rx)
+    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian")
+    ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian"), TRUE)
+    if (is.character(ramsvm.out)) {
+      return("gaussian MSVM g1 failed")
+    }
+    #prediction on test data
+    fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+    performance[1, 2] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$impute, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
+    cat("gaussian g1 over!", "\n")
     
-    msvm_weight <- rep(0, n_train)
     
-    #weighted by Yi/πi
-    msvm_weight[1:(n_train/K)] <- train_df_GPS$R[1:(n_train/K)]/train_df_GPS$p1[1:(n_train/K)]
-    msvm_weight[(n_train/K + 1):(2 * n_train/K)] <- train_df_GPS$R[(n_train/K + 1):(2 * n_train/K)]/train_df_GPS$p2[(n_train/K + 1):(2 * n_train/K)]
-    msvm_weight[(2 * n_train/K + 1):(3 * n_train/K)] <- train_df_GPS$R[(2 * n_train/K + 1):(3 * n_train/K)]/train_df_GPS$p3[(2 * n_train/K + 1):(3 * n_train/K)]
+    ######################### GPS matching gweight1#####################################
+    #weight by g1()
+    msvm_weight <- as.matrix(match.gps.res$g.weight1)
     
-    msvm_weight <- as.matrix(msvm_weight)
+    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+    ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
+    if (is.character(ramsvm.out)) {
+      return("gaussian MSVM gweight1 failed")
+    }
+    #prediction on test data
+    fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+    performance[1, 4] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$impute, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
+    cat("gaussian gweight1 over!", "\n")
     
-    cv_param <- cvfun(inputX, inputY, originR = as.matrix(train_df$R), originA = inputY, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+    
+    ######################## GPS matching gweight2#######################################
+    #weight by g2()
+    msvm_weight <- as.matrix(match.gps.res$g.weight2)
+    
+    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
+    ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = as.vector(msvm_weight)), TRUE)
+    if (is.character(ramsvm.out)) {
+      return("gaussian MSVM gweight2 failed")
+    }
+    #prediction on test data
+    fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
+    performance[1, 6] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$impute, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
+    cat("gaussian gweight2 over!", "\n")
+    
+    
+    ############## augmented owl ################
+    trt.owlmd <- owl.md(X = as.matrix(inputdata[, 1:p]), R = inputdata$impute, A = inputdata$A, testX = as.matrix(testing[, 1:p]))
+    performance[1, 7] <- valuefun(X = as.matrix(testing[,1:p]), A = testing$A, R = testing$impute, est_ITR = trt.owlmd, if_test = TRUE, testing_id = folds[[f]])
+    cat("augmented owl over!", "\n")
+    remove(trt.owlmd)
+    ############### OWL #####################
+    inputY <- as.matrix(inputdata$A) #here, the imputY is the treatment A, used as label
+    logistic.formula=formula(paste("A ~ ", paste("X",seq(p),sep = '',collapse = '+')))
+    logistic.fit <- multinom(logistic.formula, data = inputdata, trace = F)
+    
+    prob.matrix <- fitted(logistic.fit) # each row is (Pr(1|X),..,Pr(K|X))
+    prob.A=rep(0, n.train) # vector of Pr(A|X)
+    for(k in 1:K){
+      prob.A[inputdata$A==k]=prob.matrix[inputdata$A==k,k]
+    }
+    
+    #weight for owl, Ri/Pr(Ai|Xi). If min(R)<0, we should use R<- R-min(R) to handle the negative outcome. In our setting, it is always positive.
+    msvm_weight <- as.matrix(inputdata$impute/prob.A)
+    
+    cv_param <- cvfun(inputX, inputY, originR = originR, originA = originA, fold = 3, lambda = lambda_param, kparam = kernel_param, kernel = "gaussian", weight = msvm_weight)
     ramsvm.out <- try(ramsvm(inputX, inputY, lambda = cv_param$lambda, kparam = cv_param$kparam, kernel = "gaussian", weight = msvm_weight), TRUE)
     if (is.character(ramsvm.out)) {
       return("gaussian owl failed")
     }
-    
     #prediction on test data
     fit.class <- predict(ramsvm.out, as.matrix(testing[, 1:p]))
-    
-    performance[1, 8] <- valuefun(testing, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
-    testing$gau_owl <- fit.class[[paste(cv_param$lambda)]]
-    
+    performance[1, 8] <- valuefun(A = testing$A, X = as.matrix(testing[, 1:p]), R = testing$impute, est_ITR = fit.class[[paste(cv_param$lambda)]], if_test = TRUE, testing_id = folds[[f]])
     cat("gaussian owl over!", "\n")
+    
+    remove(inputX,inputY,originR,originA,match.cov.res,match.gps.res,msvm_weight,logistic.fit)
+    
+    
+    ###############Cox model#####################
+    Coxtrain <- inputdata
+    Coxtrain$A <- factor(Coxtrain$A)
+    
+    #Cox regression with (X,A,AX)
+    cox_formula <- formula(paste("Surv(R,censor) ~ (A) * (", paste(covariate_name, collapse = "+"),")" ))
+    cox_model <- coxph(cox_formula, data = Coxtrain, method = "breslow", eps = 1e-07, iter.max = 20)
+    
+    cox_result=matrix(0,nrow = n.test,ncol = K) # the risk score of each treatment
+    for(k in 1:K){
+      test_Coxdf <- data.frame(testing[, 1:p], A = factor(rep(k, n.test)))
+      cox_result[, k] <- predict(cox_model, test_Coxdf, type = "risk")
+    }
+    
+    predict_ITR <- apply(cox_result, 1, which.min)
+    
+    performance[1, 9] <- valuefun(X = as.matrix(testing[,1:p]), A = testing$A, R = testing$impute, est_ITR = predict_ITR, if_test = TRUE, testing_id = folds[[f]])
+    
+    cat("standard cox over!", "\n")
+    remove(Coxtrain,cox_formula,cox_model,cox_result,test_Coxdf)
+    
+    ################ Q-learning with censored data ######################
+    #L1/Elastic-Net penalty linear regression of log(R) on (1,A,X,AX) adjusted with censor weighting, where we introduce dummy variable for A
+    #similar argument as Zhao et al.(2015) Doubly robust learning for estimating individualized treatment with censored data
+    #estimate censor distribution by cox model
+    CensorCoxdata <- inputdata[,-ncol(inputdata)]
+    CensorCoxdata$A <- factor(CensorCoxdata$A)
+    CensorCoxdata$censor <- 1-CensorCoxdata$censor
+    CensorCox.formula= formula(paste("Surv(R,censor) ~ (A)*(", paste("X",seq(p),sep = '',collapse = '+'),')')) # Cox regression on (X,A,XA)
+    Censorcox_model <- coxph(formula = CensorCox.formula, data = CensorCoxdata, method = "breslow", eps = 1e-07, iter.max = 20)
+    
+    CensorSurvfun=rep(1,n.train) #S(Ri|Xi,Ai) for delta_i=1.
+    for(i in which(inputdata$censor==1)){
+      surfun=survfit(Censorcox_model,newdata = CensorCoxdata[i,]) #survival function of C given (A,X)
+      CensorSurvfun[i]=surfun$surv[findInterval(CensorCoxdata$R[i],surfun$time)]
+    }
+    remove(CensorCoxdata,CensorCox.formula,Censorcox_model,surfun)
+    
+    
+    Qlearndata = inputdata
+    Qlearndata$A=factor(Qlearndata$A) #factor for generating the interactions
+    Qlearndata$R=log(Qlearndata$R+0.00001)
+    Ql.weight=inputdata$censor/CensorSurvfun
+    
+    #generate the interaction terms by hand. Here we use -1 to exclude the first column since it is 1 vector, in glmnet it automatically includes the intercept
+    Qlearnformula=formula(paste("~ (A)*(", paste("X",seq(p),sep = '',collapse = '+'),')'))
+    Ql.modelmat=model.matrix(Qlearnformula,Qlearndata)[,-1] 
+    
+    Qlearn.res=cv.glmnet(x = Ql.modelmat,y=Qlearndata$R,family='gaussian',weights = Ql.weight,alpha = 1)
+    # coef(Qlearn.res)
+    
+    Qlearn.res=glmnet(x = Ql.modelmat,y=Qlearndata$R,family='gaussian',weights = Ql.weight,alpha = 1,lambda=Qlearn.res$lambda.min) #tune lambda by cv.glmnet
+    
+    Qlearn.newdata=testing[rep(1:n.test,K),1:p] #construct the big matrix, if only one factor in data, the model.matrix will go wrong
+    Qlearn.newdata=cbind(Qlearn.newdata,A=rep(1:K,each=n.test))
+    Qlearn.newdata$A=factor(Qlearn.newdata$A)
+    Ql.model.newmat=model.matrix(Qlearnformula,Qlearn.newdata)[,-1] 
+    
+    Qlearn.pred.matrix=matrix(predict(Qlearn.res,Ql.model.newmat),nrow = n.test,byrow = F) #each row is the prediction of Q-learning
+    
+    predict_ITR <- apply(Qlearn.pred.matrix, 1, which.max) # the optimal ITR
+    
+    performance[1, 10] <- valuefun(X = as.matrix(testing[,1:p]), A = testing$A, R = testing$impute, est_ITR = predict_ITR, if_test = TRUE, testing_id = folds[[f]])
+    cat("Q-learning over!", "\n")
+    
+    remove(Qlearndata,Qlearnformula,Ql.weight,Qlearn.res,predict_ITR,Qlearn.pred.matrix,Qlearn.newdata,Ql.modelmat,Ql.model.newmat)
+    
+    ######################### AD-learning ################################
+    # See Equation (28) in Qi et al.(2020) Multi-Armed Angle-Based Direct Learning for Estimating Optimal Individualized Treatment Rules With Various Outcomes for details
+    AD_lambda_max=1
+    AD_lambda_min_ratio <- 0.01
+    AD_lambda_seq_length <- 5
+    
+    #similar as glmnet, find the maximum lambda that all the coefficients are zero
+    flag <- FALSE
+    repeat { 
+      coef <- ADlearning.surv(time = inputdata$R,event = inputdata$censor,A = inputdata$A,X = as.matrix(inputdata[,1:p]),prob_A = prob.A,lambda = AD_lambda_max)
+      if(all(abs(coef) < 1e-5)) { # search downward
+        if(flag) { break }
+        AD_lambda_max <- AD_lambda_max / 2
+      } else { # search upward
+        flag <- TRUE
+        AD_lambda_max <- AD_lambda_max * 2
+      }
+    }
+    AD_lambda_seq= AD_lambda_max * exp(seq(0, log(AD_lambda_min_ratio), length.out = AD_lambda_seq_length))
+    
+    w.k.matrix<-matrix(0,nrow=K-1,ncol = K) #each column is w_k, (K-1)-dimensional vector
+    for(k in 1:K) w.k.matrix[,k]=encode(k,K)
+    
+    #find the optimal lambda and the Bhat
+    cv.AD.res=cv.ADlearning.surv(inputdata = inputdata,prob.A = prob.A,w.k.matrix=w.k.matrix,lambda = AD_lambda_seq) 
+    Bhat.opt=ADlearning.surv(time = inputdata$R,event = inputdata$censor,A = inputdata$A,X = as.matrix(inputdata[,1:p]),prob_A = prob.A,lambda = cv.AD.res$lambda)
+    
+    AD.pred.matrix=as.matrix(testing[,1:p])%*%Bhat.opt%*%w.k.matrix
+    predict_ITR=apply(AD.pred.matrix,MARGIN = 1,which.min)
+    
+    performance[1, 11] <- valuefun(X = as.matrix(testing[,1:p]), A = testing$A, R = testing$impute, est_ITR = predict_ITR, if_test = TRUE, testing_id = folds[[f]])
     
     result[f, ] <- performance  
   }
