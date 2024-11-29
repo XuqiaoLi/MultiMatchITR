@@ -16,8 +16,8 @@ library(randomForestSRC)
 library(glmnet)
 library(statmod)
 
-setwd('/Volumes/YW/Projects/ITR/data')  # setwd("C:/Users/XQLi/Desktop/Individualized Treatment Rules/ITR-final/code-revise/revise-realdata")
-source('../code/ITR-covgpsmatch-funcs.r') # source('ITR-covgpsmatch-funcs.r')
+setwd('/Volumes/YW/Projects/ITR/data')
+source('../code/ITR-covgpsmatch-funcs.r')
 hcc <- read.csv("hcc-2022.csv") # hcc <- read.csv("hcc-simplified.csv")
 set.seed(8884)
 
