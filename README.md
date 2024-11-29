@@ -7,6 +7,6 @@ estimate the optimal ITRs with continuous and survival data in multi-arm observa
 * `simulation_survival.R` :  scenarios with survival data for the proposed and compared methods.
 
 ## Real data application
-* `hcc-simplified.csv` : synthetic hepatocellular carcinoma data with noise.
+* `hcc-simplified.csv` : synthetic hepatocellular carcinoma data with noise, for illustration purpose.
 * `ITR-covgpsmatch-funcs.R` : the functions for implementation, including matching with covariates and generalized propensity scores.
 * `hcc-covgpsmatch.R` : the main function.
